@@ -81,6 +81,34 @@ fn draw(frame: &mut Frame, app: &App) {
     let workspaces_focused = app.focus == Focus::Workspaces;
     let tasks_focused = app.focus == Focus::Tasks;
 
+    // A muted hint colour: lighter than the body text but not glaring, so it
+    // stays readable on the highlighted (cyan) row.
+    let hint_style = Style::default().fg(Color::Gray);
+
+    let (move_src_ws, move_origin, move_item_dest) = match &app.mode {
+        jot_cli::Mode::Moving {
+            src_ws,
+            origin,
+            dest,
+        } => match dest {
+            jot_cli::MoveDest::Item { as_child, .. } => {
+                (Some(*src_ws), Some(origin.clone()), Some(*as_child))
+            }
+            jot_cli::MoveDest::Workspace => (Some(*src_ws), Some(origin.clone()), None),
+        },
+        _ => (None, None, None),
+    };
+    // Picking a destination workspace (the origin item leaves via the left edge).
+    let choosing_workspace = matches!(
+        &app.mode,
+        jot_cli::Mode::Moving {
+            dest: jot_cli::MoveDest::Workspace,
+            ..
+        }
+    );
+    // The ⇅ marker only makes sense while the source workspace is on screen.
+    let origin_visible = move_src_ws == Some(app.store.selected_workspace);
+
     let workspace_items = app
         .store
         .workspaces
@@ -88,18 +116,23 @@ fn draw(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(index, workspace)| {
             let label = format!("{} ({})", workspace.name, workspace.items.len());
-            if index == app.store.selected_workspace {
-                ListItem::new(label).style(selection_style(workspaces_focused))
+            let selected = index == app.store.selected_workspace;
+            let style = if selected {
+                selection_style(workspaces_focused)
             } else {
-                ListItem::new(label)
+                Style::default()
+            };
+            if selected && choosing_workspace {
+                ListItem::new(Line::from(vec![
+                    Span::raw(label),
+                    Span::styled("  ← move here", hint_style),
+                ]))
+                .style(style)
+            } else {
+                ListItem::new(label).style(style)
             }
         })
         .collect::<Vec<_>>();
-
-    let move_state = match &app.mode {
-        jot_cli::Mode::Moving { origin, as_child } => Some((origin.clone(), *as_child)),
-        _ => None,
-    };
 
     let items = app
         .flattened_items()
@@ -107,10 +140,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .map(|item| {
             let indent = "  ".repeat(item.depth);
             let selected = app.selected_path.as_ref() == Some(&item.path);
-            let is_origin = move_state
-                .as_ref()
-                .map(|(origin, _)| origin == &item.path)
-                .unwrap_or(false);
+            let is_origin = origin_visible && move_origin.as_ref() == Some(&item.path);
 
             // Leading glyph: ⇅ while this item is the one being moved,
             // ▼ when its children are folded away, otherwise blank.
@@ -152,20 +182,15 @@ fn draw(frame: &mut Frame, app: &App) {
                 Span::raw(format!(" {}", item.title)),
             ];
 
-            // While moving, the selected row is the drop target. Show where the
-            // item will land, and an arrow when it will nest as a child.
-            if selected && let Some((_, as_child)) = &move_state {
-                let hint = if *as_child {
+            // While moving within the tree, the selected row is the drop target.
+            // Show where the item will land, with an arrow when it nests.
+            if selected && let Some(as_child) = move_item_dest {
+                let hint = if as_child {
                     "  ↳ as child"
                 } else {
                     "  ← insert after"
                 };
-                spans.push(Span::styled(
-                    hint,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::styled(hint, hint_style));
             }
 
             ListItem::new(Line::from(spans)).style(row_style)

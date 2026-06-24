@@ -130,14 +130,27 @@ pub enum EditTarget {
     RenameSelected,
 }
 
+/// Where a moved item will land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveDest {
+    /// Drop relative to `anchor` in the source workspace — after it as a
+    /// sibling, or appended as its child when `as_child` is set.
+    Item { anchor: Vec<usize>, as_child: bool },
+    /// Append to the top level of the currently selected workspace.
+    Workspace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Editing { target: EditTarget, input: String },
     ConfirmDelete,
-    /// Relocating `origin`; the current selection marks the drop position,
-    /// nesting the item as a child when `as_child` is set.
-    Moving { origin: Vec<usize>, as_child: bool },
+    /// Relocating the item at `origin` (which lives in `src_ws`) to `dest`.
+    Moving {
+        src_ws: usize,
+        origin: Vec<usize>,
+        dest: MoveDest,
+    },
 }
 
 pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • d delete • w workspace • ? help";
@@ -209,7 +222,11 @@ impl App {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
-            Mode::Moving { origin, as_child } => self.handle_moving_key(key, origin, as_child),
+            Mode::Moving {
+                src_ws,
+                origin,
+                dest,
+            } => self.handle_moving_key(key, src_ws, origin, dest),
         }
     }
 
@@ -256,11 +273,16 @@ impl App {
                 Update::None
             }
             KeyCode::Char('w') => {
-                self.mode = Mode::Editing {
-                    target: EditTarget::NewWorkspace,
-                    input: String::new(),
-                };
-                self.status = String::from("New workspace name");
+                if self.focus == Focus::Workspaces {
+                    self.mode = Mode::Editing {
+                        target: EditTarget::NewWorkspace,
+                        input: String::new(),
+                    };
+                    self.status = String::from("New workspace name");
+                } else {
+                    self.focus = Focus::Workspaces;
+                    self.status = format!("Workspace: {}", self.current_workspace().name);
+                }
                 Update::None
             }
             KeyCode::Char('e') => {
@@ -294,8 +316,12 @@ impl App {
                     Some(origin) => {
                         self.focus = Focus::Tasks;
                         self.mode = Mode::Moving {
-                            origin,
-                            as_child: false,
+                            src_ws: self.store.selected_workspace,
+                            origin: origin.clone(),
+                            dest: MoveDest::Item {
+                                anchor: origin,
+                                as_child: false,
+                            },
                         };
                         self.status = self.move_status(false);
                     }
@@ -341,7 +367,30 @@ impl App {
         }
     }
 
-    fn handle_moving_key(&mut self, key: KeyEvent, origin: Vec<usize>, as_child: bool) -> Update {
+    fn handle_moving_key(
+        &mut self,
+        key: KeyEvent,
+        src_ws: usize,
+        origin: Vec<usize>,
+        dest: MoveDest,
+    ) -> Update {
+        match dest {
+            MoveDest::Item { anchor, as_child } => {
+                self.handle_moving_item_key(key, src_ws, origin, anchor, as_child)
+            }
+            MoveDest::Workspace => self.handle_moving_workspace_key(key, src_ws, origin),
+        }
+    }
+
+    fn handle_moving_item_key(
+        &mut self,
+        key: KeyEvent,
+        src_ws: usize,
+        origin: Vec<usize>,
+        anchor: Vec<usize>,
+        as_child: bool,
+    ) -> Update {
+        let mut anchor = anchor;
         let mut as_child = as_child;
         match key.code {
             KeyCode::Esc => {
@@ -350,22 +399,119 @@ impl App {
                 return Update::None;
             }
             KeyCode::Enter => {
-                let target = self.selected_path.clone();
                 self.mode = Mode::Normal;
-                return match target {
-                    Some(target) if self.confirm_move(&origin, &target, as_child) => Update::Save,
-                    _ => Update::None,
+                return if self.confirm_move(&origin, &anchor, as_child) {
+                    Update::Save
+                } else {
+                    Update::None
                 };
             }
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(-1);
+                anchor = self.selected_path.clone().unwrap_or(anchor);
+                as_child = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(1);
+                anchor = self.selected_path.clone().unwrap_or(anchor);
+                as_child = false;
+            }
             KeyCode::Right | KeyCode::Char('l') => as_child = true,
-            KeyCode::Left | KeyCode::Char('h') => as_child = false,
+            KeyCode::Left | KeyCode::Char('h') => {
+                if as_child {
+                    // First step out of nesting back to a sibling drop.
+                    as_child = false;
+                } else if anchor.len() > 1 {
+                    // Climb to the parent level.
+                    anchor.truncate(anchor.len() - 1);
+                } else {
+                    // Already at the top level: jump out to workspace choice.
+                    return self.enter_workspace_dest(src_ws, origin);
+                }
+            }
+            KeyCode::Char('w') => return self.enter_workspace_dest(src_ws, origin),
             _ => {}
         }
 
+        self.focus = Focus::Tasks;
+        self.selected_path = Some(anchor.clone());
         self.status = self.move_status(as_child);
-        self.mode = Mode::Moving { origin, as_child };
+        self.mode = Mode::Moving {
+            src_ws,
+            origin,
+            dest: MoveDest::Item { anchor, as_child },
+        };
+        Update::None
+    }
+
+    fn handle_moving_workspace_key(
+        &mut self,
+        key: KeyEvent,
+        src_ws: usize,
+        origin: Vec<usize>,
+    ) -> Update {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Move canceled");
+                return Update::None;
+            }
+            KeyCode::Enter => {
+                let dest_ws = self.store.selected_workspace;
+                self.mode = Mode::Normal;
+                return if self.confirm_move_to_workspace(src_ws, &origin, dest_ws) {
+                    Update::Save
+                } else {
+                    Update::None
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
+                self.move_workspace(-1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_workspace(1),
+            KeyCode::Right | KeyCode::Char('l') => {
+                // Drop back into the source workspace's tree for precise placement.
+                if self.store.selected_workspace == src_ws
+                    && !self.current_workspace().items.is_empty()
+                {
+                    let anchor = vec![0];
+                    self.focus = Focus::Tasks;
+                    self.selected_path = Some(anchor.clone());
+                    self.status = self.move_status(false);
+                    self.mode = Mode::Moving {
+                        src_ws,
+                        origin,
+                        dest: MoveDest::Item {
+                            anchor,
+                            as_child: false,
+                        },
+                    };
+                    return Update::None;
+                }
+                self.move_workspace(1);
+            }
+            _ => {}
+        }
+
+        self.focus = Focus::Workspaces;
+        self.status = self.move_workspace_status();
+        self.mode = Mode::Moving {
+            src_ws,
+            origin,
+            dest: MoveDest::Workspace,
+        };
+        Update::None
+    }
+
+    fn enter_workspace_dest(&mut self, src_ws: usize, origin: Vec<usize>) -> Update {
+        self.focus = Focus::Workspaces;
+        self.store.selected_workspace = src_ws;
+        self.status = self.move_workspace_status();
+        self.mode = Mode::Moving {
+            src_ws,
+            origin,
+            dest: MoveDest::Workspace,
+        };
         Update::None
     }
 
@@ -375,10 +521,15 @@ impl App {
             .map(|item| item.title.clone())
             .unwrap_or_default();
         if as_child {
-            format!("Move: nest under \"{target}\" • ← back • Enter confirm • Esc cancel")
+            format!("Move: nest under \"{target}\" • ← out • Enter confirm • Esc cancel")
         } else {
-            format!("Move: after \"{target}\" • → nest as child • Enter confirm • Esc cancel")
+            format!("Move: after \"{target}\" • → nest • ← parent/workspace • Enter • Esc")
         }
+    }
+
+    fn move_workspace_status(&self) -> String {
+        let name = self.current_workspace().name.clone();
+        format!("Move to workspace \"{name}\" • ↑/↓ pick • → into list • Enter • Esc")
     }
 
     fn confirm_move(&mut self, origin: &[usize], target: &[usize], as_child: bool) -> bool {
@@ -412,6 +563,38 @@ impl App {
                 false
             }
         }
+    }
+
+    fn confirm_move_to_workspace(
+        &mut self,
+        src_ws: usize,
+        origin: &[usize],
+        dest_ws: usize,
+    ) -> bool {
+        let Some(src) = self.store.workspaces.get_mut(src_ws) else {
+            self.status = String::from("Move failed");
+            return false;
+        };
+        let Some(moved) = take_at_path(&mut src.items, origin) else {
+            self.status = String::from("Move failed");
+            return false;
+        };
+        let title = moved.title.clone();
+
+        let Some(dest) = self.store.workspaces.get_mut(dest_ws) else {
+            // Destination vanished; put it back where it came from.
+            self.store.workspaces[src_ws].items.push(moved);
+            self.status = String::from("Move failed");
+            return false;
+        };
+        dest.items.push(moved);
+        let new_index = dest.items.len() - 1;
+
+        self.store.selected_workspace = dest_ws;
+        self.selected_path = Some(vec![new_index]);
+        self.focus = Focus::Tasks;
+        self.status = format!("Moved \"{title}\" to {}", self.store.workspaces[dest_ws].name);
+        true
     }
 
     fn handle_editing_key(
@@ -1032,6 +1215,84 @@ mod tests {
         assert_eq!(flat.len(), 2);
         assert_eq!(flat[0].title, "Parent");
         assert_eq!(flat[1].title, "Child");
+    }
+
+    #[test]
+    fn left_arrow_climbs_then_jumps_to_workspace_choice() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_child(String::from("Child"));
+        app.selected_path = Some(vec![0, 0]);
+
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Left); // climb from Child to Parent level
+        match &app.mode {
+            Mode::Moving {
+                dest: MoveDest::Item { anchor, as_child },
+                ..
+            } => {
+                assert_eq!(anchor, &vec![0]);
+                assert!(!as_child);
+            }
+            other => panic!("expected item move, got {other:?}"),
+        }
+
+        press(&mut app, KeyCode::Left); // top level → jump out to workspace choice
+        assert!(matches!(
+            app.mode,
+            Mode::Moving {
+                dest: MoveDest::Workspace,
+                ..
+            }
+        ));
+        assert_eq!(app.focus, Focus::Workspaces);
+    }
+
+    #[test]
+    fn move_item_to_another_workspace() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Task"));
+        app.add_workspace(String::from("Other"));
+        app.store.selected_workspace = 0;
+        app.focus = Focus::Tasks;
+        app.selected_path = Some(vec![0]);
+
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('w')); // jump to workspace choice
+        assert!(matches!(
+            app.mode,
+            Mode::Moving {
+                dest: MoveDest::Workspace,
+                ..
+            }
+        ));
+        press(&mut app, KeyCode::Down); // select "Other"
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.store.workspaces[0].items.len(), 0);
+        assert_eq!(app.store.workspaces[1].items.len(), 1);
+        assert_eq!(app.store.workspaces[1].items[0].title, "Task");
+        assert_eq!(app.store.selected_workspace, 1);
+    }
+
+    #[test]
+    fn w_focuses_workspace_then_opens_dialog() {
+        let mut app = App::new(Store::default());
+        assert_eq!(app.focus, Focus::Tasks);
+
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.focus, Focus::Workspaces);
+        assert_eq!(app.mode, Mode::Normal);
+
+        press(&mut app, KeyCode::Char('w'));
+        assert!(matches!(
+            app.mode,
+            Mode::Editing {
+                target: EditTarget::NewWorkspace,
+                ..
+            }
+        ));
     }
 
     #[test]

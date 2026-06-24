@@ -162,7 +162,9 @@ impl App {
             store,
             selected_path: None,
             mode: Mode::Normal,
-            status: String::from("q quit • h/l workspace • j/k move • a add • o child • e rename"),
+            status: String::from(
+                "q quit • h/l workspace • j/k move • a add • o child • e rename • x toggle • d delete • w workspace",
+            ),
         };
         app.ensure_selection();
         app

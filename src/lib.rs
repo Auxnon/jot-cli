@@ -132,6 +132,13 @@ pub enum Mode {
     Editing { target: EditTarget, input: String },
 }
 
+/// Which panel currently receives up/down navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Workspaces,
+    Tasks,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlatItem {
     pub path: Vec<usize>,
@@ -152,6 +159,7 @@ pub struct App {
     pub store: Store,
     pub selected_path: Option<Vec<usize>>,
     pub mode: Mode,
+    pub focus: Focus,
     pub status: String,
 }
 
@@ -162,8 +170,9 @@ impl App {
             store,
             selected_path: None,
             mode: Mode::Normal,
+            focus: Focus::Tasks,
             status: String::from(
-                "q quit • h/l workspace • j/k move • a add • o child • e rename • x toggle • d delete • w workspace",
+                "q quit • ←/→ focus pane • ↑/↓ move • a add • o child • e rename • x toggle • d delete • w workspace",
             ),
         };
         app.ensure_selection();
@@ -188,7 +197,7 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Update {
         match self.mode.clone() {
             Mode::Normal => self.handle_normal_key(key),
-            Mode::Editing { target, mut input } => self.handle_editing_key(key, target, &mut input),
+            Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
         }
     }
 
@@ -196,19 +205,26 @@ impl App {
         match key.code {
             KeyCode::Char('q') => Update::Quit,
             KeyCode::Char('j') | KeyCode::Down => {
-                self.move_selection(1);
+                self.move_down();
                 Update::None
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.move_selection(-1);
+                self.move_up();
                 Update::None
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                self.move_workspace(-1);
+                self.set_focus(Focus::Workspaces);
                 Update::None
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.move_workspace(1);
+                self.set_focus(Focus::Tasks);
+                Update::None
+            }
+            KeyCode::Tab => {
+                self.set_focus(match self.focus {
+                    Focus::Workspaces => Focus::Tasks,
+                    Focus::Tasks => Focus::Workspaces,
+                });
                 Update::None
             }
             KeyCode::Char('a') => {
@@ -269,7 +285,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         target: EditTarget,
-        input: &mut String,
+        mut input: String,
     ) -> Update {
         match key.code {
             KeyCode::Esc => {
@@ -296,13 +312,19 @@ impl App {
             }
             KeyCode::Backspace => {
                 input.pop();
+                self.mode = Mode::Editing { target, input };
                 Update::None
             }
             KeyCode::Char(ch) => {
                 input.push(ch);
+                self.mode = Mode::Editing { target, input };
                 Update::None
             }
-            _ => Update::None,
+            _ => {
+                // Preserve the in-progress input for any unhandled key.
+                self.mode = Mode::Editing { target, input };
+                Update::None
+            }
         }
     }
 
@@ -317,6 +339,31 @@ impl App {
             .is_none()
         {
             self.selected_path = Some(flat[0].path.clone());
+        }
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+        self.status = match focus {
+            Focus::Workspaces => format!("Workspace: {}", self.current_workspace().name),
+            Focus::Tasks => self
+                .selected_item()
+                .map(|item| item.title.clone())
+                .unwrap_or_else(|| String::from("Tasks")),
+        };
+    }
+
+    fn move_down(&mut self) {
+        match self.focus {
+            Focus::Workspaces => self.move_workspace(1),
+            Focus::Tasks => self.move_selection(1),
+        }
+    }
+
+    fn move_up(&mut self) {
+        match self.focus {
+            Focus::Workspaces => self.move_workspace(-1),
+            Focus::Tasks => self.move_selection(-1),
         }
     }
 
@@ -349,6 +396,7 @@ impl App {
         self.store.workspaces.push(Workspace::new(name.clone()));
         self.store.selected_workspace = self.store.workspaces.len() - 1;
         self.selected_path = None;
+        self.focus = Focus::Workspaces;
         self.status = format!("Created workspace: {name}");
         true
     }
@@ -374,6 +422,7 @@ impl App {
             }
         }
 
+        self.focus = Focus::Tasks;
         self.status = format!("Added item: {title}");
         true
     }
@@ -400,6 +449,7 @@ impl App {
             }
         }
 
+        self.focus = Focus::Tasks;
         self.status = format!("Added child item: {title}");
         true
     }
@@ -543,7 +593,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<PathBuf, Str
             }
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  h/l switch workspaces\n  j/k move items\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  d delete item\n  w new workspace\n  q quit",
+                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  d delete item\n  w new workspace\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -602,6 +652,57 @@ mod tests {
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[1].title, "Child");
         assert_eq!(flat[1].depth, 1);
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Update {
+        app.handle_key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn typing_in_edit_mode_accumulates_input() {
+        let mut app = App::new(Store::default());
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('i'));
+
+        match &app.mode {
+            Mode::Editing { input, .. } => assert_eq!(input, "Hi"),
+            other => panic!("expected editing mode, got {other:?}"),
+        }
+
+        press(&mut app, KeyCode::Backspace);
+        match &app.mode {
+            Mode::Editing { input, .. } => assert_eq!(input, "H"),
+            other => panic!("expected editing mode, got {other:?}"),
+        }
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("H")
+        );
+    }
+
+    #[test]
+    fn focus_toggles_navigation_target() {
+        let mut app = App::new(Store::default());
+        app.add_workspace(String::from("Work"));
+        app.add_workspace(String::from("Home"));
+        app.store.selected_workspace = 0;
+
+        // Focus the workspace pane; up/down moves between workspaces.
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.focus, Focus::Workspaces);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.store.selected_workspace, 1);
+
+        // Focus the tasks pane; up/down moves between items, not workspaces.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.focus, Focus::Tasks);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.store.selected_workspace, 1);
     }
 
     #[test]

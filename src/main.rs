@@ -4,11 +4,11 @@ use std::{
 };
 
 use crossterm::event::{self, Event, KeyEventKind};
-use jot_cli::{App, Update, parse_args};
+use jot_cli::{App, Focus, Update, parse_args};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
@@ -78,6 +78,9 @@ fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(24), Constraint::Min(10)])
         .split(layout[0]);
 
+    let workspaces_focused = app.focus == Focus::Workspaces;
+    let tasks_focused = app.focus == Focus::Tasks;
+
     let workspace_items = app
         .store
         .workspaces
@@ -86,7 +89,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .map(|(index, workspace)| {
             let label = format!("{} ({})", workspace.name, workspace.items.len());
             if index == app.store.selected_workspace {
-                ListItem::new(label).style(Style::default().add_modifier(Modifier::BOLD))
+                ListItem::new(label).style(selection_style(workspaces_focused))
             } else {
                 ListItem::new(label)
             }
@@ -101,7 +104,7 @@ fn draw(frame: &mut Frame, app: &App) {
             let indent = "  ".repeat(item.depth);
             let line = format!("{indent}{prefix} {}", item.title);
             let style = if app.selected_path.as_ref() == Some(&item.path) {
-                Style::default().add_modifier(Modifier::REVERSED)
+                selection_style(tasks_focused)
             } else {
                 Style::default()
             };
@@ -112,15 +115,11 @@ fn draw(frame: &mut Frame, app: &App) {
     let workspace_title = format!("Workspace: {}", app.current_workspace().name);
     frame.render_widget(
         List::new(workspace_items)
-            .block(Block::default().title("Workspaces").borders(Borders::ALL)),
+            .block(focus_block("Workspaces", workspaces_focused)),
         columns[0],
     );
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title(workspace_title)
-                .borders(Borders::ALL),
-        ),
+        List::new(items).block(focus_block(workspace_title, tasks_focused)),
         columns[1],
     );
 
@@ -149,6 +148,33 @@ fn draw(frame: &mut Frame, app: &App) {
             popup,
         );
     }
+}
+
+/// Highlight the selected row; brighter when its panel currently has focus.
+fn selection_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+}
+
+/// A bordered block whose border is highlighted when its panel has focus.
+fn focus_block(title: impl Into<String>, focused: bool) -> Block<'static> {
+    let border_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Block::default()
+        .title(title.into())
+        .borders(Borders::ALL)
+        .border_style(border_style)
 }
 
 fn centered_rect(

@@ -153,7 +153,7 @@ pub enum Mode {
     },
 }
 
-pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • d delete • w workspace • ? help";
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • ⌃c copy • ⌃v paste • d delete • w workspace • ? help";
 
 /// Which panel currently receives up/down navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +215,34 @@ impl App {
         let mut path = Vec::new();
         flatten_items(&self.current_workspace().items, 0, &mut path, &mut flat);
         flat
+    }
+
+    /// Title of the selected item, for placing on the clipboard. Updates the
+    /// status line to reflect the outcome.
+    pub fn copy_selected(&mut self) -> Option<String> {
+        let title = self.selected_item().map(|item| item.title.clone());
+        self.status = match &title {
+            Some(text) => format!("Copied: {text}"),
+            None => String::from("Nothing to copy"),
+        };
+        title
+    }
+
+    /// Handle pasted text. While editing, the content is appended to the current
+    /// input; otherwise it pre-fills a new "add item" dialog awaiting the user's
+    /// confirmation.
+    pub fn paste(&mut self, content: String) {
+        let sanitized = content.replace(['\n', '\r'], " ");
+        if let Mode::Editing { input, .. } = &mut self.mode {
+            input.push_str(&sanitized);
+            return;
+        }
+        self.focus = Focus::Tasks;
+        self.mode = Mode::Editing {
+            target: EditTarget::NewSibling,
+            input: sanitized.trim().to_string(),
+        };
+        self.status = String::from("Pasted — Enter to add item, Esc to cancel");
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Update {
@@ -1293,6 +1321,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn copy_selected_returns_title() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Buy milk"));
+        app.selected_path = Some(vec![0]);
+
+        assert_eq!(app.copy_selected(), Some(String::from("Buy milk")));
+    }
+
+    #[test]
+    fn copy_with_no_selection_returns_none() {
+        let mut app = App::new(Store::default());
+        assert_eq!(app.copy_selected(), None);
+    }
+
+    #[test]
+    fn paste_opens_add_dialog_then_accepts() {
+        let mut app = App::new(Store::default());
+        app.paste(String::from("Pasted task\n"));
+
+        match &app.mode {
+            Mode::Editing {
+                target: EditTarget::NewSibling,
+                input,
+            } => assert_eq!(input, "Pasted task"),
+            other => panic!("expected add dialog, got {other:?}"),
+        }
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("Pasted task")
+        );
+    }
+
+    #[test]
+    fn paste_while_editing_appends_to_input() {
+        let mut app = App::new(Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('H'));
+        app.paste(String::from("ello\nworld"));
+
+        match &app.mode {
+            Mode::Editing { input, .. } => assert_eq!(input, "Hello world"),
+            other => panic!("expected editing mode, got {other:?}"),
+        }
     }
 
     #[test]

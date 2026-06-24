@@ -3,8 +3,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{self, Event, KeyEventKind};
-use jot_cli::{App, Focus, Update, parse_args};
+use crossterm::{
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
+    execute,
+};
+use jot_cli::{App, Focus, Mode, Update, parse_args};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
@@ -40,6 +46,22 @@ fn run(
     app: &mut App,
     data_path: &std::path::Path,
 ) -> io::Result<()> {
+    // Bracketed paste lets the terminal hand us paste payloads as Event::Paste.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    let mut clipboard = arboard::Clipboard::new().ok();
+
+    let result = event_loop(&mut terminal, app, data_path, &mut clipboard);
+
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    result
+}
+
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    data_path: &std::path::Path,
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> io::Result<()> {
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
 
@@ -47,17 +69,41 @@ fn run(
         terminal.draw(|frame| draw(frame, app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-            && key.kind != KeyEventKind::Release
-        {
-            match app.handle_key(key) {
-                Update::Quit => {
-                    app.store.save(data_path)?;
-                    return Ok(());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let copy = ctrl
+                        && matches!(app.mode, Mode::Normal)
+                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+                    let paste =
+                        ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'));
+
+                    if copy {
+                        if let Some(text) = app.copy_selected()
+                            && let Some(cb) = clipboard.as_mut()
+                        {
+                            let _ = cb.set_text(text);
+                        }
+                    } else if paste {
+                        let content = clipboard
+                            .as_mut()
+                            .and_then(|cb| cb.get_text().ok())
+                            .unwrap_or_default();
+                        app.paste(content);
+                    } else {
+                        match app.handle_key(key) {
+                            Update::Quit => {
+                                app.store.save(data_path)?;
+                                return Ok(());
+                            }
+                            Update::Save => app.store.save(data_path)?,
+                            Update::None => {}
+                        }
+                    }
                 }
-                Update::Save => app.store.save(data_path)?,
-                Update::None => {}
+                Event::Paste(content) => app.paste(content),
+                _ => {}
             }
         }
 

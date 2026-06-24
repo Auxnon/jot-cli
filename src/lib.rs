@@ -135,7 +135,12 @@ pub enum Mode {
     Normal,
     Editing { target: EditTarget, input: String },
     ConfirmDelete,
+    /// Relocating `origin`; the current selection marks the drop position,
+    /// nesting the item as a child when `as_child` is set.
+    Moving { origin: Vec<usize>, as_child: bool },
 }
+
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • d delete • w workspace • ? help";
 
 /// Which panel currently receives up/down navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,9 +183,7 @@ impl App {
             selected_path: None,
             mode: Mode::Normal,
             focus: Focus::Tasks,
-            status: String::from(
-                "q quit • ←/→ focus pane • ↑/↓ move • a add • o child • e rename • x toggle • z fold • d delete • w workspace",
-            ),
+            status: String::from(CONTROLS),
         };
         app.ensure_selection();
         app
@@ -206,6 +209,7 @@ impl App {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
+            Mode::Moving { origin, as_child } => self.handle_moving_key(key, origin, as_child),
         }
     }
 
@@ -285,6 +289,24 @@ impl App {
                     Update::None
                 }
             }
+            KeyCode::Char('m') => {
+                match self.selected_path.clone() {
+                    Some(origin) => {
+                        self.focus = Focus::Tasks;
+                        self.mode = Mode::Moving {
+                            origin,
+                            as_child: false,
+                        };
+                        self.status = self.move_status(false);
+                    }
+                    None => self.status = String::from("Nothing to move"),
+                }
+                Update::None
+            }
+            KeyCode::Char('?') => {
+                self.status = String::from(CONTROLS);
+                Update::None
+            }
             KeyCode::Char('d') => {
                 match self.selected_item() {
                     Some(item) => {
@@ -316,6 +338,79 @@ impl App {
                 Update::None
             }
             _ => Update::None,
+        }
+    }
+
+    fn handle_moving_key(&mut self, key: KeyEvent, origin: Vec<usize>, as_child: bool) -> Update {
+        let mut as_child = as_child;
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Move canceled");
+                return Update::None;
+            }
+            KeyCode::Enter => {
+                let target = self.selected_path.clone();
+                self.mode = Mode::Normal;
+                return match target {
+                    Some(target) if self.confirm_move(&origin, &target, as_child) => Update::Save,
+                    _ => Update::None,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Right | KeyCode::Char('l') => as_child = true,
+            KeyCode::Left | KeyCode::Char('h') => as_child = false,
+            _ => {}
+        }
+
+        self.status = self.move_status(as_child);
+        self.mode = Mode::Moving { origin, as_child };
+        Update::None
+    }
+
+    fn move_status(&self, as_child: bool) -> String {
+        let target = self
+            .selected_item()
+            .map(|item| item.title.clone())
+            .unwrap_or_default();
+        if as_child {
+            format!("Move: nest under \"{target}\" • ← back • Enter confirm • Esc cancel")
+        } else {
+            format!("Move: after \"{target}\" • → nest as child • Enter confirm • Esc cancel")
+        }
+    }
+
+    fn confirm_move(&mut self, origin: &[usize], target: &[usize], as_child: bool) -> bool {
+        if target == origin {
+            self.status = if as_child {
+                String::from("Can't nest an item under itself")
+            } else {
+                String::from("Item left in place")
+            };
+            return false;
+        }
+        if target.starts_with(origin) {
+            self.status = String::from("Can't move an item into its own subtree");
+            return false;
+        }
+
+        let target_adj = adjust_after_removal(target, origin);
+        match relocate(
+            &mut self.current_workspace_mut().items,
+            origin,
+            &target_adj,
+            as_child,
+        ) {
+            Some((new_path, title)) => {
+                self.selected_path = Some(new_path);
+                self.status = format!("Moved: {title}");
+                true
+            }
+            None => {
+                self.status = String::from("Move failed");
+                false
+            }
         }
     }
 
@@ -639,6 +734,61 @@ fn remove_at_path(items: &mut Vec<TodoItem>, path: &[usize]) -> bool {
     }
 }
 
+fn take_at_path(items: &mut Vec<TodoItem>, path: &[usize]) -> Option<TodoItem> {
+    let (&index, parent_path) = path.split_last()?;
+    let list = list_mut(items, parent_path)?;
+    if index < list.len() {
+        Some(list.remove(index))
+    } else {
+        None
+    }
+}
+
+/// Recompute `path` after the item at `removed` is deleted from the tree.
+/// Only siblings that followed `removed` in the same list shift down by one.
+fn adjust_after_removal(path: &[usize], removed: &[usize]) -> Vec<usize> {
+    let mut result = path.to_vec();
+    let Some((&removed_index, parent)) = removed.split_last() else {
+        return result;
+    };
+    let pos = parent.len();
+    if path.len() > pos && path[..pos] == removed[..pos] && path[pos] > removed_index {
+        result[pos] -= 1;
+    }
+    result
+}
+
+/// Remove the item at `origin`, then re-insert it relative to `target_adj`
+/// (a path already adjusted for the removal). Returns the moved item's new
+/// path and title.
+fn relocate(
+    items: &mut Vec<TodoItem>,
+    origin: &[usize],
+    target_adj: &[usize],
+    as_child: bool,
+) -> Option<(Vec<usize>, String)> {
+    let moved = take_at_path(items, origin)?;
+    let title = moved.title.clone();
+
+    if as_child {
+        let parent = item_mut(items, target_adj)?;
+        parent.folded = false;
+        parent.children.push(moved);
+        let mut new_path = target_adj.to_vec();
+        new_path.push(parent.children.len() - 1);
+        Some((new_path, title))
+    } else {
+        let (&target_index, parent_path) = target_adj.split_last()?;
+        let insert_index = target_index + 1;
+        let list = list_mut(items, parent_path)?;
+        let insert_index = insert_index.min(list.len());
+        list.insert(insert_index, moved);
+        let mut new_path = parent_path.to_vec();
+        new_path.push(insert_index);
+        Some((new_path, title))
+    }
+}
+
 fn next_path_after_removal(flat: &[FlatItem], removed: &[usize]) -> Option<Vec<usize>> {
     let position = flat.iter().position(|item| item.path == removed)?;
     flat.get(position + 1)
@@ -661,7 +811,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<PathBuf, Str
             }
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  d delete item\n  w new workspace\n  q quit",
+                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -817,6 +967,79 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('y'));
         assert_eq!(app.flattened_items().len(), 0);
+    }
+
+    #[test]
+    fn move_as_sibling_reorders_items() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("A"));
+        app.add_sibling(String::from("B"));
+        app.add_sibling(String::from("C"));
+
+        // Move A (index 0) to after C.
+        app.selected_path = Some(vec![0]);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(app.mode, Mode::Moving { .. }));
+        press(&mut app, KeyCode::Down); // target B
+        press(&mut app, KeyCode::Down); // target C
+        press(&mut app, KeyCode::Enter);
+
+        let titles: Vec<_> = app
+            .flattened_items()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, vec!["B", "C", "A"]);
+        // Selection follows the moved item.
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn move_as_child_nests_item() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_sibling(String::from("Loose"));
+
+        // Move "Loose" (index 1) to be a child of "Parent" (index 0).
+        app.selected_path = Some(vec![1]);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Up); // target Parent
+        press(&mut app, KeyCode::Right); // nest as child
+        press(&mut app, KeyCode::Enter);
+
+        let flat = app.flattened_items();
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat[0].title, "Parent");
+        assert_eq!(flat[0].depth, 0);
+        assert_eq!(flat[1].title, "Loose");
+        assert_eq!(flat[1].depth, 1);
+    }
+
+    #[test]
+    fn move_into_own_subtree_is_rejected() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_child(String::from("Child"));
+
+        app.selected_path = Some(vec![0]); // Parent
+        // Target the child (its own descendant) and try to nest under it.
+        assert!(!app.confirm_move(&[0], &[0, 0], true));
+        // Tree is unchanged.
+        let flat = app.flattened_items();
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat[0].title, "Parent");
+        assert_eq!(flat[1].title, "Child");
+    }
+
+    #[test]
+    fn help_key_restores_controls() {
+        let mut app = App::new(Store::default());
+        app.status = String::from("something else");
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.status, CONTROLS);
     }
 
     #[test]

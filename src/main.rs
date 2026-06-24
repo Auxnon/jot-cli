@@ -96,44 +96,79 @@ fn draw(frame: &mut Frame, app: &App) {
         })
         .collect::<Vec<_>>();
 
+    let move_state = match &app.mode {
+        jot_cli::Mode::Moving { origin, as_child } => Some((origin.clone(), *as_child)),
+        _ => None,
+    };
+
     let items = app
         .flattened_items()
         .into_iter()
         .map(|item| {
             let indent = "  ".repeat(item.depth);
-            // A down arrow flags an item whose nested children are folded away.
-            let fold = if item.has_children && item.folded {
+            let selected = app.selected_path.as_ref() == Some(&item.path);
+            let is_origin = move_state
+                .as_ref()
+                .map(|(origin, _)| origin == &item.path)
+                .unwrap_or(false);
+
+            // Leading glyph: ⇅ while this item is the one being moved,
+            // ▼ when its children are folded away, otherwise blank.
+            let lead = if is_origin {
+                "⇅"
+            } else if item.has_children && item.folded {
                 "▼"
             } else {
                 " "
             };
-            // White circle for open tasks, colored ✗ for completed — both bold.
-            let (symbol, symbol_style) = if item.done {
-                (
-                    "✗",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                (
-                    "○",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
-            };
-            let row_style = if app.selected_path.as_ref() == Some(&item.path) {
+
+            let row_style = if selected {
                 selection_style(tasks_focused)
+            } else if is_origin {
+                Style::default().add_modifier(Modifier::DIM)
             } else {
                 Style::default()
             };
-            let line = Line::from(vec![
-                Span::raw(format!("{indent}{fold} ")),
+
+            // White circle for open tasks, green ✗ for completed — both bold.
+            // On the highlighted row the symbol adopts the row color so it
+            // stays legible against the selection background.
+            let symbol = if item.done { "✗" } else { "○" };
+            let symbol_style = if selected {
+                row_style.add_modifier(Modifier::BOLD)
+            } else if item.done {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            };
+
+            let mut spans = vec![
+                Span::raw(format!("{indent}{lead} ")),
                 Span::styled(symbol, symbol_style),
                 Span::raw(format!(" {}", item.title)),
-            ]);
-            ListItem::new(line).style(row_style)
+            ];
+
+            // While moving, the selected row is the drop target. Show where the
+            // item will land, and an arrow when it will nest as a child.
+            if selected && let Some((_, as_child)) = &move_state {
+                let hint = if *as_child {
+                    "  ↳ as child"
+                } else {
+                    "  ← insert after"
+                };
+                spans.push(Span::styled(
+                    hint,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            ListItem::new(Line::from(spans)).style(row_style)
         })
         .collect::<Vec<_>>();
 
@@ -149,7 +184,9 @@ fn draw(frame: &mut Frame, app: &App) {
     );
 
     let status = match &app.mode {
-        jot_cli::Mode::Normal | jot_cli::Mode::ConfirmDelete => app.status.clone(),
+        jot_cli::Mode::Normal | jot_cli::Mode::ConfirmDelete | jot_cli::Mode::Moving { .. } => {
+            app.status.clone()
+        }
         jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
     };
     frame.render_widget(

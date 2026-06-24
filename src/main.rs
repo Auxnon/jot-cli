@@ -6,9 +6,11 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
+    terminal::supports_keyboard_enhancement,
 };
 use jot_cli::{App, Focus, Mode, Update, parse_args};
 use ratatui::{
@@ -48,10 +50,22 @@ fn run(
 ) -> io::Result<()> {
     // Bracketed paste lets the terminal hand us paste payloads as Event::Paste.
     let _ = execute!(io::stdout(), EnableBracketedPaste);
+    // The Kitty keyboard protocol lets supporting terminals report the macOS
+    // Command key (as SUPER), so Cmd+C can reach us instead of being swallowed.
+    let enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
+    if enhanced {
+        let _ = execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let mut clipboard = arboard::Clipboard::new().ok();
 
     let result = event_loop(&mut terminal, app, data_path, &mut clipboard);
 
+    if enhanced {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     result
 }
@@ -72,12 +86,14 @@ fn event_loop(
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let copy = ctrl
+                    // Ctrl on most platforms; SUPER is the macOS Command key.
+                    let modkey = key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::SUPER);
+                    let copy = modkey
                         && matches!(app.mode, Mode::Normal)
                         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
                     let paste =
-                        ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'));
+                        modkey && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'));
 
                     if copy {
                         if let Some(text) = app.copy_selected()

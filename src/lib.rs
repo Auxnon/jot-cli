@@ -13,6 +13,9 @@ pub struct TodoItem {
     pub done: bool,
     #[serde(default)]
     pub children: Vec<TodoItem>,
+    /// When true, this item's children are hidden in the list.
+    #[serde(default)]
+    pub folded: bool,
 }
 
 impl TodoItem {
@@ -21,6 +24,7 @@ impl TodoItem {
             title: title.into(),
             done: false,
             children: Vec::new(),
+            folded: false,
         }
     }
 }
@@ -145,6 +149,8 @@ pub struct FlatItem {
     pub depth: usize,
     pub title: String,
     pub done: bool,
+    pub has_children: bool,
+    pub folded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +178,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Tasks,
             status: String::from(
-                "q quit • ←/→ focus pane • ↑/↓ move • a add • o child • e rename • x toggle • d delete • w workspace",
+                "q quit • ←/→ focus pane • ↑/↓ move • a add • o child • e rename • x toggle • z fold • d delete • w workspace",
             ),
         };
         app.ensure_selection();
@@ -265,6 +271,13 @@ impl App {
             }
             KeyCode::Char('x') | KeyCode::Char(' ') => {
                 if self.toggle_selected() {
+                    Update::Save
+                } else {
+                    Update::None
+                }
+            }
+            KeyCode::Char('z') => {
+                if self.toggle_fold() {
                     Update::Save
                 } else {
                     Update::None
@@ -464,6 +477,32 @@ impl App {
         }
     }
 
+    fn toggle_fold(&mut self) -> bool {
+        let outcome = match self.selected_item_mut() {
+            Some(item) if item.children.is_empty() => None,
+            Some(item) => {
+                item.folded = !item.folded;
+                Some((item.folded, item.title.clone()))
+            }
+            None => return false,
+        };
+
+        match outcome {
+            Some((true, title)) => {
+                self.status = format!("Folded: {title}");
+                true
+            }
+            Some((false, title)) => {
+                self.status = format!("Unfolded: {title}");
+                true
+            }
+            None => {
+                self.status = String::from("No nested items to fold");
+                false
+            }
+        }
+    }
+
     fn toggle_selected(&mut self) -> bool {
         if let Some(item) = self.selected_item_mut() {
             item.done = !item.done;
@@ -520,8 +559,12 @@ fn flatten_items(
             depth,
             title: item.title.clone(),
             done: item.done,
+            has_children: !item.children.is_empty(),
+            folded: item.folded,
         });
-        flatten_items(&item.children, depth + 1, path, flat);
+        if !item.folded {
+            flatten_items(&item.children, depth + 1, path, flat);
+        }
         path.pop();
     }
 }
@@ -593,7 +636,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<PathBuf, Str
             }
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  d delete item\n  w new workspace\n  q quit",
+                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  d delete item\n  w new workspace\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -628,6 +671,7 @@ mod tests {
                     title: String::from("Parent"),
                     done: true,
                     children: vec![TodoItem::new("Child")],
+                    folded: false,
                 }],
             }],
             selected_workspace: 0,
@@ -683,6 +727,37 @@ mod tests {
             app.selected_item().map(|item| item.title.as_str()),
             Some("H")
         );
+    }
+
+    #[test]
+    fn folding_hides_children_and_marks_parent() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_child(String::from("Child"));
+        // Select the parent before folding.
+        app.selected_path = Some(vec![0]);
+
+        assert!(app.toggle_fold());
+        let flat = app.flattened_items();
+        assert_eq!(flat.len(), 1, "child should be hidden when folded");
+        assert!(flat[0].has_children);
+        assert!(flat[0].folded);
+
+        // Down should not descend into the hidden child.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_path, Some(vec![0]));
+
+        assert!(app.toggle_fold());
+        assert_eq!(app.flattened_items().len(), 2, "child visible again");
+    }
+
+    #[test]
+    fn folding_leaf_item_is_noop() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Lonely"));
+        app.selected_path = Some(vec![0]);
+
+        assert!(!app.toggle_fold());
     }
 
     #[test]

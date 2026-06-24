@@ -102,7 +102,13 @@ fn draw(frame: &mut Frame, app: &App) {
         .map(|item| {
             let prefix = if item.done { "[x]" } else { "[ ]" };
             let indent = "  ".repeat(item.depth);
-            let line = format!("{indent}{prefix} {}", item.title);
+            // A down arrow flags an item whose nested children are folded away.
+            let marker = if item.has_children && item.folded {
+                "▼"
+            } else {
+                " "
+            };
+            let line = format!("{indent}{marker} {prefix} {}", item.title);
             let style = if app.selected_path.as_ref() == Some(&item.path) {
                 selection_style(tasks_focused)
             } else {

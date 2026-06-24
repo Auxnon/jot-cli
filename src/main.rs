@@ -9,7 +9,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
@@ -100,21 +100,40 @@ fn draw(frame: &mut Frame, app: &App) {
         .flattened_items()
         .into_iter()
         .map(|item| {
-            let prefix = if item.done { "[x]" } else { "[ ]" };
             let indent = "  ".repeat(item.depth);
             // A down arrow flags an item whose nested children are folded away.
-            let marker = if item.has_children && item.folded {
+            let fold = if item.has_children && item.folded {
                 "▼"
             } else {
                 " "
             };
-            let line = format!("{indent}{marker} {prefix} {}", item.title);
-            let style = if app.selected_path.as_ref() == Some(&item.path) {
+            // White circle for open tasks, colored ✗ for completed — both bold.
+            let (symbol, symbol_style) = if item.done {
+                (
+                    "✗",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    "○",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            let row_style = if app.selected_path.as_ref() == Some(&item.path) {
                 selection_style(tasks_focused)
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(line)).style(style)
+            let line = Line::from(vec![
+                Span::raw(format!("{indent}{fold} ")),
+                Span::styled(symbol, symbol_style),
+                Span::raw(format!(" {}", item.title)),
+            ]);
+            ListItem::new(line).style(row_style)
         })
         .collect::<Vec<_>>();
 
@@ -130,7 +149,7 @@ fn draw(frame: &mut Frame, app: &App) {
     );
 
     let status = match &app.mode {
-        jot_cli::Mode::Normal => app.status.clone(),
+        jot_cli::Mode::Normal | jot_cli::Mode::ConfirmDelete => app.status.clone(),
         jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
     };
     frame.render_widget(

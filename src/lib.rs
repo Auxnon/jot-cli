@@ -134,6 +134,7 @@ pub enum EditTarget {
 pub enum Mode {
     Normal,
     Editing { target: EditTarget, input: String },
+    ConfirmDelete,
 }
 
 /// Which panel currently receives up/down navigation.
@@ -204,6 +205,7 @@ impl App {
         match self.mode.clone() {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
+            Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
         }
     }
 
@@ -284,11 +286,34 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
+                match self.selected_item() {
+                    Some(item) => {
+                        let title = item.title.clone();
+                        self.mode = Mode::ConfirmDelete;
+                        self.status = format!("Delete \"{title}\"? d/y = yes, n/Esc = no");
+                    }
+                    None => self.status = String::from("Nothing to delete"),
+                }
+                Update::None
+            }
+            _ => Update::None,
+        }
+    }
+
+    fn handle_confirm_delete_key(&mut self, key: KeyEvent) -> Update {
+        match key.code {
+            KeyCode::Char('d') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
                 if self.remove_selected() {
                     Update::Save
                 } else {
                     Update::None
                 }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Delete canceled");
+                Update::None
             }
             _ => Update::None,
         }
@@ -758,6 +783,40 @@ mod tests {
         app.selected_path = Some(vec![0]);
 
         assert!(!app.toggle_fold());
+    }
+
+    #[test]
+    fn delete_requires_confirmation() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Doomed"));
+        app.selected_path = Some(vec![0]);
+
+        // First d only arms the confirmation; item still present.
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        assert_eq!(app.flattened_items().len(), 1);
+
+        // n cancels.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.flattened_items().len(), 1);
+
+        // d then d confirms.
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.flattened_items().len(), 0);
+    }
+
+    #[test]
+    fn delete_confirms_with_y() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Doomed"));
+        app.selected_path = Some(vec![0]);
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.flattened_items().len(), 0);
     }
 
     #[test]

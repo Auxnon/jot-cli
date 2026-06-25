@@ -22,23 +22,42 @@ use ratatui::{
 };
 
 fn main() -> io::Result<()> {
-    let data_path = match parse_args(env::args()) {
-        Ok(path) => path,
+    let args = match parse_args(env::args()) {
+        Ok(args) => args,
         Err(message) if message.starts_with("Usage:") => {
             println!("{message}");
             return Ok(());
         }
         Err(message) => {
             eprintln!("{message}");
-            return Ok(());
+            std::process::exit(1);
         }
     };
 
-    let store = jot_cli::Store::load(&data_path)?;
+    let mut store = jot_cli::Store::load(&args.data_path)?;
+
+    // `--add` is a one-shot command-line action: add the task and exit without
+    // ever entering the TUI.
+    if let Some(title) = &args.add {
+        match store.add_item(title, args.workspace.as_deref()) {
+            Ok(workspace) => {
+                store.save(&args.data_path)?;
+                if !args.silent {
+                    println!("Added \"{title}\" to {workspace}");
+                }
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let mut app = App::new(store);
 
     let terminal = ratatui::init();
-    let result = run(terminal, &mut app, &data_path);
+    let result = run(terminal, &mut app, &args.data_path);
     ratatui::restore();
     result
 }

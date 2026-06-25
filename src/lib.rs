@@ -99,6 +99,23 @@ impl Store {
             self.selected_workspace = self.workspaces.len().saturating_sub(1);
         }
     }
+
+    /// Append a top-level item to a workspace from the command line. With no
+    /// `workspace` the first (top) workspace is used; a named workspace that
+    /// doesn't exist is an error. Returns the target workspace's name.
+    pub fn add_item(&mut self, title: &str, workspace: Option<&str>) -> Result<String, String> {
+        let index = match workspace {
+            Some(name) => self
+                .workspaces
+                .iter()
+                .position(|ws| ws.name == name)
+                .ok_or_else(|| format!("workspace not found: {name}"))?,
+            None => 0,
+        };
+        let ws = &mut self.workspaces[index];
+        ws.items.push(TodoItem::new(title));
+        Ok(ws.name.clone())
+    }
 }
 
 pub fn default_data_path() -> PathBuf {
@@ -1007,10 +1024,26 @@ fn next_path_after_removal(flat: &[FlatItem], removed: &[usize]) -> Option<Vec<u
         .map(|item| item.path.clone())
 }
 
-pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<PathBuf, String> {
+/// Parsed command-line invocation. When `add` is set, the program performs a
+/// one-shot add and exits instead of launching the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliArgs {
+    pub data_path: PathBuf,
+    /// Title of a task to add directly from the command line (`-a`/`--add`).
+    pub add: Option<String>,
+    /// Target workspace by name (`-w`/`--workspace`); defaults to the top one.
+    pub workspace: Option<String>,
+    /// Suppress success output (`--silent`); errors are still reported.
+    pub silent: bool,
+}
+
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
     let mut args = args.into_iter();
     let _ = args.next();
     let mut data_path = None;
+    let mut add = None;
+    let mut workspace = None;
+    let mut silent = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1020,16 +1053,34 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<PathBuf, Str
                     .ok_or_else(|| String::from("expected a path after --data-path"))?;
                 data_path = Some(PathBuf::from(value));
             }
+            "-a" | "--add" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| String::from("expected a task after --add"))?;
+                add = Some(value);
+            }
+            "-w" | "--workspace" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| String::from("expected a name after --workspace"))?;
+                workspace = Some(value);
+            }
+            "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>]\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace <name>] [--silent]\n\nAdd a task without opening the TUI:\n  -a, --add <task>        add a task and exit (defaults to the top workspace)\n  -w, --workspace <name>  add to the named workspace (error if it doesn't exist)\n  --silent                print nothing on success (errors still shown)\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
 
-    Ok(data_path.unwrap_or_else(default_data_path))
+    Ok(CliArgs {
+        data_path: data_path.unwrap_or_else(default_data_path),
+        add,
+        workspace,
+        silent,
+    })
 }
 
 #[cfg(test)]
@@ -1397,6 +1448,64 @@ mod tests {
         assert_eq!(app.focus, Focus::Tasks);
         press(&mut app, KeyCode::Down);
         assert_eq!(app.store.selected_workspace, 1);
+    }
+
+    fn cli(args: &[&str]) -> Result<CliArgs, String> {
+        let mut full = vec![String::from("jot-cli")];
+        full.extend(args.iter().map(|arg| arg.to_string()));
+        parse_args(full)
+    }
+
+    #[test]
+    fn parse_add_flags() {
+        let parsed = cli(&["-a", "Buy milk", "-w", "Home", "--silent"]).expect("parse");
+        assert_eq!(parsed.add.as_deref(), Some("Buy milk"));
+        assert_eq!(parsed.workspace.as_deref(), Some("Home"));
+        assert!(parsed.silent);
+
+        let long = cli(&["--add", "Task", "--workspace", "Work"]).expect("parse");
+        assert_eq!(long.add.as_deref(), Some("Task"));
+        assert_eq!(long.workspace.as_deref(), Some("Work"));
+        assert!(!long.silent);
+    }
+
+    #[test]
+    fn parse_add_without_value_errors() {
+        assert!(cli(&["-a"]).is_err());
+        assert!(cli(&["--workspace"]).is_err());
+    }
+
+    #[test]
+    fn add_item_defaults_to_top_workspace() {
+        let mut store = Store {
+            workspaces: vec![Workspace::new("Inbox"), Workspace::new("Other")],
+            selected_workspace: 1,
+        };
+
+        let name = store.add_item("Top task", None).expect("add");
+        assert_eq!(name, "Inbox");
+        assert_eq!(store.workspaces[0].items.len(), 1);
+        assert_eq!(store.workspaces[0].items[0].title, "Top task");
+        assert_eq!(store.workspaces[1].items.len(), 0);
+    }
+
+    #[test]
+    fn add_item_targets_named_workspace() {
+        let mut store = Store {
+            workspaces: vec![Workspace::new("Inbox"), Workspace::new("Home")],
+            selected_workspace: 0,
+        };
+
+        let name = store.add_item("Chore", Some("Home")).expect("add");
+        assert_eq!(name, "Home");
+        assert_eq!(store.workspaces[1].items[0].title, "Chore");
+    }
+
+    #[test]
+    fn add_item_unknown_workspace_errors() {
+        let mut store = Store::default();
+        let result = store.add_item("Nope", Some("Missing"));
+        assert_eq!(result, Err(String::from("workspace not found: Missing")));
     }
 
     #[test]

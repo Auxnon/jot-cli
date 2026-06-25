@@ -100,18 +100,30 @@ impl Store {
         }
     }
 
-    /// Append a top-level item to a workspace from the command line. With no
-    /// `workspace` the first (top) workspace is used; a named workspace that
-    /// doesn't exist is an error. Returns the target workspace's name.
-    pub fn add_item(&mut self, title: &str, workspace: Option<&str>) -> Result<String, String> {
-        let index = match workspace {
+    /// Resolve a workspace by name to its index. With no `workspace` the first
+    /// (top) workspace is used; a named workspace that doesn't exist is an
+    /// error. `normalize` guarantees at least one workspace exists.
+    pub fn workspace_index(&self, workspace: Option<&str>) -> Result<usize, String> {
+        match workspace {
             Some(name) => self
                 .workspaces
                 .iter()
                 .position(|ws| ws.name == name)
-                .ok_or_else(|| format!("workspace not found: {name}"))?,
-            None => 0,
-        };
+                .ok_or_else(|| format!("workspace not found: {name}")),
+            None => Ok(0),
+        }
+    }
+
+    /// The display name of the workspace `add_item` would target.
+    pub fn workspace_name(&self, workspace: Option<&str>) -> Result<String, String> {
+        Ok(self.workspaces[self.workspace_index(workspace)?].name.clone())
+    }
+
+    /// Append a top-level item to a workspace from the command line. Returns
+    /// the target workspace's name. See [`Store::workspace_index`] for how the
+    /// workspace is chosen.
+    pub fn add_item(&mut self, title: &str, workspace: Option<&str>) -> Result<String, String> {
+        let index = self.workspace_index(workspace)?;
         let ws = &mut self.workspaces[index];
         ws.items.push(TodoItem::new(title));
         Ok(ws.name.clone())
@@ -1024,8 +1036,9 @@ fn next_path_after_removal(flat: &[FlatItem], removed: &[usize]) -> Option<Vec<u
         .map(|item| item.path.clone())
 }
 
-/// Parsed command-line invocation. When `add` is set, the program performs a
-/// one-shot add and exits instead of launching the TUI.
+/// Parsed command-line invocation. When `add` is set the program performs a
+/// one-shot add and exits; when `prompt_add` is set it shows an inline input
+/// field; otherwise it launches the full TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliArgs {
     pub data_path: PathBuf,
@@ -1033,16 +1046,19 @@ pub struct CliArgs {
     pub add: Option<String>,
     /// Target workspace by name (`-w`/`--workspace`); defaults to the top one.
     pub workspace: Option<String>,
+    /// `-w`/`--workspace` was given without `-a`: show an inline input field.
+    pub prompt_add: bool,
     /// Suppress success output (`--silent`); errors are still reported.
     pub silent: bool,
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     let _ = args.next();
     let mut data_path = None;
     let mut add = None;
     let mut workspace = None;
+    let mut prompt_add = false;
     let mut silent = false;
 
     while let Some(arg) = args.next() {
@@ -1060,15 +1076,20 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
                 add = Some(value);
             }
             "-w" | "--workspace" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| String::from("expected a name after --workspace"))?;
-                workspace = Some(value);
+                prompt_add = true;
+                // The workspace name is optional: consume the next argument as
+                // the name only when it isn't another flag. Bare `-w` targets
+                // the top workspace.
+                if let Some(next) = args.peek()
+                    && !next.starts_with('-')
+                {
+                    workspace = args.next();
+                }
             }
             "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace <name>] [--silent]\n\nAdd a task without opening the TUI:\n  -a, --add <task>        add a task and exit (defaults to the top workspace)\n  -w, --workspace <name>  add to the named workspace (error if it doesn't exist)\n  --silent                print nothing on success (errors still shown)\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -1079,6 +1100,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
         data_path: data_path.unwrap_or_else(default_data_path),
         add,
         workspace,
+        prompt_add,
         silent,
     })
 }
@@ -1461,6 +1483,7 @@ mod tests {
         let parsed = cli(&["-a", "Buy milk", "-w", "Home", "--silent"]).expect("parse");
         assert_eq!(parsed.add.as_deref(), Some("Buy milk"));
         assert_eq!(parsed.workspace.as_deref(), Some("Home"));
+        assert!(parsed.prompt_add);
         assert!(parsed.silent);
 
         let long = cli(&["--add", "Task", "--workspace", "Work"]).expect("parse");
@@ -1470,9 +1493,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_workspace_triggers_prompt_with_optional_name() {
+        // Bare -w: prompt mode, no name (top workspace).
+        let bare = cli(&["-w"]).expect("parse");
+        assert!(bare.prompt_add);
+        assert_eq!(bare.workspace, None);
+        assert!(bare.add.is_none());
+
+        // -w followed by a flag must not swallow the flag as the name.
+        let with_flag = cli(&["-w", "--silent"]).expect("parse");
+        assert!(with_flag.prompt_add);
+        assert_eq!(with_flag.workspace, None);
+        assert!(with_flag.silent);
+
+        // -w with a name targets that workspace.
+        let named = cli(&["--workspace", "Home"]).expect("parse");
+        assert!(named.prompt_add);
+        assert_eq!(named.workspace.as_deref(), Some("Home"));
+    }
+
+    #[test]
     fn parse_add_without_value_errors() {
         assert!(cli(&["-a"]).is_err());
-        assert!(cli(&["--workspace"]).is_err());
     }
 
     #[test]

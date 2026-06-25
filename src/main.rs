@@ -10,11 +10,12 @@ use crossterm::{
         PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::supports_keyboard_enhancement,
+    terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
 };
-use jot_cli::{App, Focus, Mode, Update, parse_args};
+use jot_cli::{App, CliArgs, Focus, Mode, Update, parse_args};
 use ratatui::{
-    DefaultTerminal, Frame,
+    DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -54,12 +55,145 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // `-w`/`--workspace` without `--add`: pop up an inline input field, add the
+    // typed task to the (possibly named) workspace, then exit.
+    if args.prompt_add {
+        return prompt_add(&mut store, &args);
+    }
+
     let mut app = App::new(store);
 
     let terminal = ratatui::init();
     let result = run(terminal, &mut app, &args.data_path);
     ratatui::restore();
     result
+}
+
+/// Validate the target workspace, show a single inline input field, and add
+/// whatever the user types. Enter confirms (empty input cancels), Esc cancels.
+fn prompt_add(store: &mut jot_cli::Store, args: &CliArgs) -> io::Result<()> {
+    // Resolve the workspace up front so a bad name fails before we prompt.
+    let workspace = match store.workspace_name(args.workspace.as_deref()) {
+        Ok(name) => name,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+
+    let Some(title) = read_inline_input(&workspace)? else {
+        return Ok(()); // canceled, or nothing typed
+    };
+
+    let name = store
+        .add_item(&title, args.workspace.as_deref())
+        .expect("workspace was validated above");
+    store.save(&args.data_path)?;
+    if !args.silent {
+        println!("Added \"{title}\" to {name}");
+    }
+    Ok(())
+}
+
+/// Draw a one-line inline prompt — styled after Charm's `gum input` — and
+/// collect a task title. An empty field shows a dim "Add to <workspace>"
+/// placeholder; a block cursor blinks in a bright pastel. Returns `None` when
+/// the user cancels (Esc) or submits empty input.
+fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
+    let placeholder = format!("Add to {workspace}");
+    // ANSI 212 is gum's default cursor colour — a bright pastel pink.
+    let pastel = Color::Indexed(212);
+    let prompt_style = Style::default().fg(pastel).add_modifier(Modifier::BOLD);
+    let placeholder_style = Style::default()
+        .fg(Color::Indexed(244))
+        .add_modifier(Modifier::DIM);
+    // A block cursor: the cell under it adopts the pastel as its background.
+    let cursor_style = Style::default().fg(Color::Black).bg(pastel);
+
+    enable_raw_mode()?;
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(1),
+        },
+    )?;
+
+    let mut input = String::new();
+    let blink = Duration::from_millis(500);
+    let mut last_blink = Instant::now();
+    let mut cursor_on = true;
+    // Any edit makes the cursor solid again, so it never blinks mid-keystroke.
+    let wake = |on: &mut bool, at: &mut Instant| {
+        *on = true;
+        *at = Instant::now();
+    };
+
+    let outcome = loop {
+        terminal.draw(|frame| {
+            let mut spans = vec![Span::styled("> ", prompt_style)];
+            if input.is_empty() {
+                // Cursor sits over the first placeholder character.
+                let mut chars = placeholder.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let head = if cursor_on {
+                            cursor_style
+                        } else {
+                            placeholder_style
+                        };
+                        spans.push(Span::styled(first.to_string(), head));
+                        spans.push(Span::styled(chars.as_str().to_string(), placeholder_style));
+                    }
+                    None if cursor_on => spans.push(Span::styled(" ", cursor_style)),
+                    None => {}
+                }
+            } else {
+                spans.push(Span::raw(input.clone()));
+                if cursor_on {
+                    spans.push(Span::styled(" ", cursor_style));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), frame.area());
+        })?;
+
+        let timeout = blink.saturating_sub(last_blink.elapsed());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Enter => break Some(input.trim().to_string()),
+                    KeyCode::Esc => break None,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    KeyCode::Char(ch) => {
+                        input.push(ch);
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    _ => {}
+                },
+                Event::Paste(content) => {
+                    input.push_str(&content.replace(['\n', '\r'], " "));
+                    wake(&mut cursor_on, &mut last_blink);
+                }
+                _ => {}
+            }
+        }
+
+        if last_blink.elapsed() >= blink {
+            cursor_on = !cursor_on;
+            last_blink = Instant::now();
+        }
+    };
+
+    // Wipe the prompt line so it doesn't linger above our output, then restore.
+    terminal.clear()?;
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    disable_raw_mode()?;
+
+    Ok(outcome.filter(|title| !title.is_empty()))
 }
 
 fn run(

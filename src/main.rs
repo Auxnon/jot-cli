@@ -9,6 +9,7 @@ use crossterm::{
         KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
+    cursor::MoveToColumn,
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
 };
@@ -189,8 +190,10 @@ fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
     };
 
     // Wipe the prompt line so it doesn't linger above our output, then restore.
+    // MoveToColumn(0) returns the cursor to the start of the line — without it
+    // raw mode leaves it where the prompt ended, indenting subsequent output.
     terminal.clear()?;
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableBracketedPaste, MoveToColumn(0));
     disable_raw_mode()?;
 
     Ok(outcome.filter(|title| !title.is_empty()))

@@ -38,6 +38,37 @@ fn main() -> io::Result<()> {
 
     let mut store = jot_cli::Store::load(&args.data_path)?;
 
+    // With Google enabled, make sure the default-list workspace exists.
+    #[cfg(feature = "google")]
+    store.ensure_google_workspace();
+
+    // `--sync` is a one-shot command-line action: reconcile with Google and exit.
+    if args.sync {
+        #[cfg(feature = "google")]
+        {
+            match jot_cli::sync::sync_store(&mut store) {
+                Ok(summary) => {
+                    store.save(&args.data_path)?;
+                    if !args.silent {
+                        println!("{}", summary.describe());
+                    }
+                }
+                Err(message) => {
+                    eprintln!("Sync failed: {message}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "google"))]
+        {
+            eprintln!(
+                "This build has no Google support. Rebuild with: cargo build --features google"
+            );
+            std::process::exit(1);
+        }
+    }
+
     // `--add` is a one-shot command-line action: add the task and exit without
     // ever entering the TUI.
     if let Some(title) = &args.add {
@@ -62,11 +93,35 @@ fn main() -> io::Result<()> {
         return prompt_add(&mut store, &args);
     }
 
+    // Auto-sync on launch when the user has enabled it.
+    #[cfg(feature = "google")]
+    if store.auto_sync {
+        match jot_cli::sync::sync_store(&mut store) {
+            Ok(_) => {
+                let _ = store.save(&args.data_path);
+            }
+            Err(message) => eprintln!("Auto-sync on launch failed: {message}"),
+        }
+    }
+
     let mut app = App::new(store);
 
     let terminal = ratatui::init();
     let result = run(terminal, &mut app, &args.data_path);
     ratatui::restore();
+
+    // Auto-sync on quit when enabled (after the terminal is restored, so any
+    // first-time auth prompt prints cleanly).
+    #[cfg(feature = "google")]
+    if app.store.auto_sync {
+        match jot_cli::sync::sync_store(&mut app.store) {
+            Ok(_) => {
+                let _ = app.store.save(&args.data_path);
+            }
+            Err(message) => eprintln!("Auto-sync on quit failed: {message}"),
+        }
+    }
+
     result
 }
 
@@ -280,6 +335,20 @@ fn event_loop(
                             }
                             Update::Save => app.store.save(data_path)?,
                             Update::None => {}
+                            #[cfg(feature = "google")]
+                            Update::Sync => {
+                                // Blocking network round-trip; the status line
+                                // already shows "Syncing…" from this frame.
+                                terminal.draw(|frame| draw(frame, app))?;
+                                match jot_cli::sync::sync_store(&mut app.store) {
+                                    Ok(summary) => app.set_status(summary.describe()),
+                                    Err(message) => {
+                                        app.set_status(format!("Sync failed: {message}"))
+                                    }
+                                }
+                                app.refresh_after_sync();
+                                app.store.save(data_path)?;
+                            }
                         }
                     }
                 }
@@ -448,6 +517,8 @@ fn draw(frame: &mut Frame, app: &App) {
         | jot_cli::Mode::ConfirmDelete
         | jot_cli::Mode::ConfirmUnfoldAll
         | jot_cli::Mode::Moving { .. } => app.status.clone(),
+        #[cfg(feature = "google")]
+        jot_cli::Mode::ConfirmEnableAutoSync => app.status.clone(),
         jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
     };
     frame.render_widget(

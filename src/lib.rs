@@ -7,6 +7,11 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "google")]
+pub mod google;
+#[cfg(feature = "google")]
+pub mod sync;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoItem {
     pub title: String,
@@ -16,6 +21,23 @@ pub struct TodoItem {
     /// When true, this item's children are hidden in the list.
     #[serde(default)]
     pub folded: bool,
+    /// Link to a Google task once this item has been synced. Always present in
+    /// the data model so files stay compatible whether or not the `google`
+    /// feature is compiled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncMeta>,
+}
+
+/// What was last synced to Google for an item, so the next sync can tell which
+/// side (local or remote) changed since.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncMeta {
+    /// The Google task id this item is linked to.
+    pub google_id: String,
+    /// Title as of the last successful sync.
+    pub synced_title: String,
+    /// Done state as of the last successful sync.
+    pub synced_done: bool,
 }
 
 impl TodoItem {
@@ -25,6 +47,7 @@ impl TodoItem {
             done: false,
             children: Vec::new(),
             folded: false,
+            sync: None,
         }
     }
 }
@@ -34,6 +57,10 @@ pub struct Workspace {
     pub name: String,
     #[serde(default)]
     pub items: Vec<TodoItem>,
+    /// When set, this workspace mirrors a Google task list with the given id.
+    /// `@default` is Google's alias for the account's default list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_tasklist: Option<String>,
 }
 
 impl Workspace {
@@ -41,6 +68,7 @@ impl Workspace {
         Self {
             name: name.into(),
             items: Vec::new(),
+            google_tasklist: None,
         }
     }
 }
@@ -51,6 +79,10 @@ pub struct Store {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub selected_workspace: usize,
+    /// When true, the app syncs Google-linked workspaces automatically on
+    /// launch and on quit. Toggled with Shift+S; persisted across runs.
+    #[serde(default)]
+    pub auto_sync: bool,
 }
 
 fn default_workspaces() -> Vec<Workspace> {
@@ -62,6 +94,7 @@ impl Default for Store {
         Self {
             workspaces: default_workspaces(),
             selected_workspace: 0,
+            auto_sync: false,
         }
     }
 }
@@ -128,6 +161,22 @@ impl Store {
         ws.items.push(TodoItem::new(title));
         Ok(ws.name.clone())
     }
+
+    /// Ensure a workspace exists that mirrors the Google default task list.
+    /// Creates a "Google" workspace bound to `@default` if none is linked yet.
+    #[cfg(feature = "google")]
+    pub fn ensure_google_workspace(&mut self) {
+        if self
+            .workspaces
+            .iter()
+            .any(|ws| ws.google_tasklist.is_some())
+        {
+            return;
+        }
+        let mut ws = Workspace::new("Google");
+        ws.google_tasklist = Some(String::from("@default"));
+        self.workspaces.push(ws);
+    }
 }
 
 pub fn default_data_path() -> PathBuf {
@@ -149,6 +198,18 @@ pub fn default_data_path() -> PathBuf {
     }
 
     PathBuf::from(".jot-cli-state.json")
+}
+
+/// Directory holding jot-cli's config files (state, Google credentials/token).
+/// Mirrors the resolution order of [`default_data_path`].
+pub fn config_dir() -> PathBuf {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home).join("jot-cli");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".config").join("jot-cli");
+    }
+    PathBuf::from(".")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +237,9 @@ pub enum Mode {
     ConfirmDelete,
     /// Confirming "unfold every item in the current workspace".
     ConfirmUnfoldAll,
+    /// Confirming "turn on auto-sync" (only enabling needs confirmation).
+    #[cfg(feature = "google")]
+    ConfirmEnableAutoSync,
     /// Relocating the item at `origin` (which lives in `src_ws`) to `dest`.
     Moving {
         src_ws: usize,
@@ -184,7 +248,11 @@ pub enum Mode {
     },
 }
 
+#[cfg(not(feature = "google"))]
 pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • m move •⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • ? help";
+
+#[cfg(feature = "google")]
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • m move •⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • s sync • S auto-sync • ? help";
 
 /// Which panel currently receives up/down navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +276,9 @@ pub enum Update {
     None,
     Save,
     Quit,
+    /// The user asked to sync now; the event loop performs the network sync.
+    #[cfg(feature = "google")]
+    Sync,
 }
 
 /// How many edits the in-memory undo history retains.
@@ -291,6 +362,18 @@ impl App {
         self.status = String::from("Pasted — Enter to add item, Esc to cancel");
     }
 
+    /// Replace the status line text (used by the event loop after a sync).
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+    }
+
+    /// Re-validate selection after a sync may have added or removed items.
+    #[cfg(feature = "google")]
+    pub fn refresh_after_sync(&mut self) {
+        self.store.normalize();
+        self.ensure_selection();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Update {
         // Capture the pre-edit state, then keep it only if the key actually
         // mutated something (signalled by `Update::Save`). Undo itself is
@@ -301,6 +384,8 @@ impl App {
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
             Mode::ConfirmUnfoldAll => self.handle_confirm_unfold_all_key(key),
+            #[cfg(feature = "google")]
+            Mode::ConfirmEnableAutoSync => self.handle_confirm_enable_auto_sync_key(key),
             Mode::Moving {
                 src_ws,
                 origin,
@@ -434,6 +519,29 @@ impl App {
                     String::from("Unfold all items in this workspace? y/n (Enter = yes)");
                 Update::None
             }
+            #[cfg(feature = "google")]
+            KeyCode::Char('s') => {
+                // Sync now — the event loop performs the network round-trip.
+                self.status = String::from("Syncing with Google…");
+                Update::Sync
+            }
+            #[cfg(feature = "google")]
+            KeyCode::Char('S') => {
+                if self.store.auto_sync {
+                    // Turning auto-sync off needs no confirmation.
+                    self.store.auto_sync = false;
+                    self.status = String::from("Auto-sync disabled");
+                    Update::Save
+                } else {
+                    // Enabling is confirmed first (it adds network calls on
+                    // every launch and quit).
+                    self.mode = Mode::ConfirmEnableAutoSync;
+                    self.status = String::from(
+                        "Enable auto-sync on launch/quit? y/n (Enter = yes)",
+                    );
+                    Update::None
+                }
+            }
             KeyCode::Char('m') => {
                 match self.selected_path.clone() {
                     Some(origin) => {
@@ -504,6 +612,25 @@ impl App {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.status = String::from("Unfold all canceled");
+                Update::None
+            }
+            _ => Update::None,
+        }
+    }
+
+    #[cfg(feature = "google")]
+    fn handle_confirm_enable_auto_sync_key(&mut self, key: KeyEvent) -> Update {
+        match key.code {
+            // Enter defaults to yes; enabling also kicks off a sync now.
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                self.store.auto_sync = true;
+                self.status = String::from("Auto-sync enabled — syncing now…");
+                Update::Sync
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Auto-sync left off");
                 Update::None
             }
             _ => Update::None,
@@ -1267,6 +1394,8 @@ pub struct CliArgs {
     pub prompt_add: bool,
     /// Suppress success output (`--silent`); errors are still reported.
     pub silent: bool,
+    /// Sync Google-linked workspaces and exit (`--sync`).
+    pub sync: bool,
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
@@ -1277,9 +1406,11 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
     let mut workspace = None;
     let mut prompt_add = false;
     let mut silent = false;
+    let mut sync = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--sync" => sync = true,
             "--data-path" => {
                 let value = args
                     .next()
@@ -1306,7 +1437,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
             "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -1319,6 +1450,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
         workspace,
         prompt_add,
         silent,
+        sync,
     })
 }
 
@@ -1348,9 +1480,12 @@ mod tests {
                     done: true,
                     children: vec![TodoItem::new("Child")],
                     folded: false,
+                    sync: None,
                 }],
+                google_tasklist: None,
             }],
             selected_workspace: 0,
+            auto_sync: false,
         };
 
         store.save(&path).expect("save store");
@@ -1901,6 +2036,7 @@ mod tests {
         let mut store = Store {
             workspaces: vec![Workspace::new("Inbox"), Workspace::new("Other")],
             selected_workspace: 1,
+            auto_sync: false,
         };
 
         let name = store.add_item("Top task", None).expect("add");
@@ -1915,6 +2051,7 @@ mod tests {
         let mut store = Store {
             workspaces: vec![Workspace::new("Inbox"), Workspace::new("Home")],
             selected_workspace: 0,
+            auto_sync: false,
         };
 
         let name = store.add_item("Chore", Some("Home")).expect("add");

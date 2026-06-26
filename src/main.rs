@@ -363,16 +363,27 @@ fn event_loop(
     }
 }
 
+/// The text shown in the status bar for the current mode.
+fn status_text(app: &App) -> String {
+    match &app.mode {
+        jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
+        _ => app.status.clone(),
+    }
+}
+
 fn draw(frame: &mut Frame, app: &App) {
-    // Size the status bar to the help text so the (long) controls line wraps
-    // across as many rows as it needs, up to a cap, instead of being clipped.
+    let status = status_text(app);
+
+    // Size the status bar to the text it's actually showing: the long controls
+    // line wraps across several rows (capped), while a short message needs only
+    // one — so the box shrinks back down when the help isn't displayed.
     let inner_width = frame.area().width.saturating_sub(2).max(1) as usize;
-    let control_rows = jot_cli::CONTROLS
+    let status_rows = status
         .chars()
         .count()
         .div_ceil(inner_width)
         .clamp(1, 4) as u16;
-    let status_height = control_rows + 2; // + top/bottom borders
+    let status_height = status_rows + 2; // + top/bottom borders
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -530,16 +541,6 @@ fn draw(frame: &mut Frame, app: &App) {
         columns[1],
     );
 
-    let status = match &app.mode {
-        jot_cli::Mode::Normal
-        | jot_cli::Mode::ConfirmDelete
-        | jot_cli::Mode::ConfirmUnfoldAll
-        | jot_cli::Mode::ConfirmDeleteHidden
-        | jot_cli::Mode::Moving { .. } => app.status.clone(),
-        #[cfg(feature = "google")]
-        jot_cli::Mode::ConfirmEnableAutoSync => app.status.clone(),
-        jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
-    };
     frame.render_widget(
         Paragraph::new(status)
             .wrap(Wrap { trim: true })

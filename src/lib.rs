@@ -882,11 +882,33 @@ impl App {
             return false;
         };
 
-        let next_selection = next_path_after_removal(&self.flattened_items(), &path);
+        // Remember the deleted row's position and depth in the flattened list.
+        // After the item (and any children) are gone, the row that slides into
+        // that same position is normally the natural next selection.
+        let removed_meta = self
+            .flattened_items()
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.path == path)
+            .map(|(pos, item)| (pos, item.depth));
         let items = &mut self.current_workspace_mut().items;
         let removed = remove_at_path(items, &path);
         if removed {
-            self.selected_path = next_selection;
+            let flat = self.flattened_items();
+            self.selected_path = removed_meta
+                .and_then(|(pos, depth)| {
+                    let prev = pos.checked_sub(1).and_then(|index| flat.get(index));
+                    match flat.get(pos) {
+                        // The row sliding up belongs to a shallower level (higher
+                        // parentage) — climb to the previous row rather than jump
+                        // out to it. Falls back to that row if there's no previous.
+                        Some(next) if next.depth < depth => prev.or(Some(next)),
+                        Some(next) => Some(next),
+                        // Deleted the last row: settle on the one before it.
+                        None => prev,
+                    }
+                })
+                .map(|item| item.path.clone());
             self.ensure_selection();
             self.status = String::from("Removed item");
         }
@@ -1027,13 +1049,6 @@ fn relocate(
         new_path.push(insert_index);
         Some((new_path, title))
     }
-}
-
-fn next_path_after_removal(flat: &[FlatItem], removed: &[usize]) -> Option<Vec<usize>> {
-    let position = flat.iter().position(|item| item.path == removed)?;
-    flat.get(position + 1)
-        .or_else(|| position.checked_sub(1).and_then(|index| flat.get(index)))
-        .map(|item| item.path.clone())
 }
 
 /// Parsed command-line invocation. When `add` is set the program performs a
@@ -1563,6 +1578,78 @@ mod tests {
         assert_eq!(
             app.selected_item().map(|item| item.title.as_str()),
             Some("Second")
+        );
+    }
+
+    #[test]
+    fn removing_middle_item_selects_the_one_that_slides_up() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("A"));
+        app.add_sibling(String::from("B"));
+        app.add_sibling(String::from("C"));
+
+        // Delete the middle item; selection should land on C (which now fills
+        // B's old slot), not jump elsewhere.
+        app.selected_path = Some(vec![1]);
+        assert!(app.remove_selected());
+        assert_eq!(app.selected_path, Some(vec![1]));
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("C")
+        );
+    }
+
+    #[test]
+    fn removing_last_child_climbs_up_instead_of_jumping_to_a_higher_level() {
+        let mut app = App::new(Store::default());
+        // Parent A with two children, then a top-level Parent B.
+        app.add_sibling(String::from("Parent A")); // [0]
+        app.add_child(String::from("Child A1")); // [0, 0]
+        app.add_sibling(String::from("Child A2")); // [0, 1]
+        app.selected_path = Some(vec![0]);
+        app.add_sibling(String::from("Parent B")); // [1]
+
+        // Delete the last child (A2). The row that would slide in is Parent B
+        // (a shallower level), so the cursor should climb up to Child A1.
+        app.selected_path = Some(vec![0, 1]);
+        assert!(app.remove_selected());
+        assert_eq!(app.selected_path, Some(vec![0, 0]));
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("Child A1")
+        );
+    }
+
+    #[test]
+    fn removing_only_child_climbs_to_parent() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent A")); // [0]
+        app.add_child(String::from("Only child")); // [0, 0]
+        app.selected_path = Some(vec![0]);
+        app.add_sibling(String::from("Parent B")); // [1]
+
+        // Deleting the only child leaves Parent B sliding up; climb to Parent A.
+        app.selected_path = Some(vec![0, 0]);
+        assert!(app.remove_selected());
+        assert_eq!(app.selected_path, Some(vec![0]));
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("Parent A")
+        );
+    }
+
+    #[test]
+    fn removing_last_item_selects_the_previous_one() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("A"));
+        app.add_sibling(String::from("B"));
+
+        app.selected_path = Some(vec![1]);
+        assert!(app.remove_selected());
+        assert_eq!(app.selected_path, Some(vec![0]));
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("A")
         );
     }
 }

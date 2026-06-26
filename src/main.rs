@@ -444,9 +444,10 @@ fn draw(frame: &mut Frame, app: &App) {
     );
 
     let status = match &app.mode {
-        jot_cli::Mode::Normal | jot_cli::Mode::ConfirmDelete | jot_cli::Mode::Moving { .. } => {
-            app.status.clone()
-        }
+        jot_cli::Mode::Normal
+        | jot_cli::Mode::ConfirmDelete
+        | jot_cli::Mode::ConfirmUnfoldAll
+        | jot_cli::Mode::Moving { .. } => app.status.clone(),
         jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
     };
     frame.render_widget(

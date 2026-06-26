@@ -174,6 +174,8 @@ pub enum Mode {
     Normal,
     Editing { target: EditTarget, input: String },
     ConfirmDelete,
+    /// Confirming "unfold every item in the current workspace".
+    ConfirmUnfoldAll,
     /// Relocating the item at `origin` (which lives in `src_ws`) to `dest`.
     Moving {
         src_ws: usize,
@@ -182,7 +184,7 @@ pub enum Mode {
     },
 }
 
-pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • ⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • ? help";
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • m move •⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • ? help";
 
 /// Which panel currently receives up/down navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +300,7 @@ impl App {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
+            Mode::ConfirmUnfoldAll => self.handle_confirm_unfold_all_key(key),
             Mode::Moving {
                 src_ws,
                 origin,
@@ -425,6 +428,12 @@ impl App {
                     Update::None
                 }
             }
+            KeyCode::Char('Z') => {
+                self.mode = Mode::ConfirmUnfoldAll;
+                self.status =
+                    String::from("Unfold all items in this workspace? y/n (Enter = yes)");
+                Update::None
+            }
             KeyCode::Char('m') => {
                 match self.selected_path.clone() {
                     Some(origin) => {
@@ -475,6 +484,26 @@ impl App {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.status = String::from("Delete canceled");
+                Update::None
+            }
+            _ => Update::None,
+        }
+    }
+
+    fn handle_confirm_unfold_all_key(&mut self, key: KeyEvent) -> Update {
+        match key.code {
+            // Enter defaults to yes.
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                if self.unfold_all() {
+                    Update::Save
+                } else {
+                    Update::None
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Unfold all canceled");
                 Update::None
             }
             _ => Update::None,
@@ -983,6 +1012,18 @@ impl App {
         }
     }
 
+    /// Unfold every item in the current workspace. Returns whether anything
+    /// was folded (and thus changed).
+    fn unfold_all(&mut self) -> bool {
+        let changed = unfold_items(&mut self.current_workspace_mut().items);
+        self.status = if changed {
+            String::from("Unfolded all items")
+        } else {
+            String::from("Nothing was folded")
+        };
+        changed
+    }
+
     fn toggle_selected(&mut self) -> bool {
         let Some(item) = self.selected_item_mut() else {
             return false;
@@ -1100,6 +1141,22 @@ fn set_done_recursive(item: &mut TodoItem, done: bool) {
     for child in &mut item.children {
         set_done_recursive(child, done);
     }
+}
+
+/// Clear `folded` on every item in the tree. Returns whether any item was
+/// actually folded (and thus changed).
+fn unfold_items(items: &mut [TodoItem]) -> bool {
+    let mut changed = false;
+    for item in items {
+        if item.folded {
+            item.folded = false;
+            changed = true;
+        }
+        if unfold_items(&mut item.children) {
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn item_mut<'a>(items: &'a mut [TodoItem], path: &[usize]) -> Option<&'a mut TodoItem> {
@@ -1375,6 +1432,39 @@ mod tests {
             undone += 1;
         }
         assert_eq!(undone, UNDO_DEPTH);
+    }
+
+    #[test]
+    fn shift_z_confirms_then_unfolds_all() {
+        let mut app = App::new(Store::default());
+        // Two separate folded parents at the top level.
+        app.add_sibling(String::from("A"));
+        app.add_child(String::from("A-child"));
+        app.selected_path = Some(vec![0]);
+        app.toggle_fold(); // fold A
+        app.add_sibling(String::from("B"));
+        app.add_child(String::from("B-child"));
+        app.selected_path = Some(vec![1]);
+        app.toggle_fold(); // fold B
+        assert!(app.store.workspaces[0].items[0].folded);
+        assert!(app.store.workspaces[0].items[1].folded);
+
+        // Shift+Z opens the confirm dialog without changing anything yet.
+        press(&mut app, KeyCode::Char('Z'));
+        assert_eq!(app.mode, Mode::ConfirmUnfoldAll);
+        assert!(app.store.workspaces[0].items[0].folded);
+
+        // n cancels, leaving folds intact.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.store.workspaces[0].items[0].folded);
+
+        // Shift+Z again, then Enter (the default = yes) unfolds everything.
+        press(&mut app, KeyCode::Char('Z'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.store.workspaces[0].items[0].folded);
+        assert!(!app.store.workspaces[0].items[1].folded);
     }
 
     fn press(app: &mut App, code: KeyCode) -> Update {

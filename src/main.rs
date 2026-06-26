@@ -250,6 +250,11 @@ fn event_loop(
                         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
                     let paste =
                         modkey && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'));
+                    // Ctrl+Z / Cmd+Z undoes the last edit. Handled here so it
+                    // never records itself onto the undo stack.
+                    let undo = modkey
+                        && matches!(app.mode, Mode::Normal)
+                        && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z'));
 
                     if copy {
                         if let Some(text) = app.copy_selected()
@@ -263,6 +268,10 @@ fn event_loop(
                             .and_then(|cb| cb.get_text().ok())
                             .unwrap_or_default();
                         app.paste(content);
+                    } else if undo {
+                        if app.undo() {
+                            app.store.save(data_path)?;
+                        }
                     } else {
                         match app.handle_key(key) {
                             Update::Quit => {
@@ -394,10 +403,18 @@ fn draw(frame: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD)
             };
 
+            // Completed tasks get a muted title so they recede; the selected
+            // row keeps its row style for legibility against the highlight.
+            let title_style = if !selected && item.done {
+                Style::default().fg(Color::Indexed(244))
+            } else {
+                Style::default()
+            };
+
             let mut spans = vec![
                 Span::raw(format!("{indent}{lead} ")),
                 Span::styled(symbol, symbol_style),
-                Span::raw(format!(" {}", item.title)),
+                Span::styled(format!(" {}", item.title), title_style),
             ];
 
             // While moving within the tree, the selected row is the drop target.

@@ -182,7 +182,7 @@ pub enum Mode {
     },
 }
 
-pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • ⌃c copy • ⌃v paste • d delete • w workspace • ? help";
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • m move • ⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • ? help";
 
 /// Which panel currently receives up/down navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +208,17 @@ pub enum Update {
     Quit,
 }
 
+/// How many edits the in-memory undo history retains.
+const UNDO_DEPTH: usize = 20;
+
+/// A point-in-time copy of everything an undo restores. Kept in memory only —
+/// never persisted to disk.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    store: Store,
+    selected_path: Option<Vec<usize>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub store: Store,
@@ -215,6 +226,9 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub status: String,
+    /// Bounded history of pre-edit snapshots, newest last. Capped at
+    /// [`UNDO_DEPTH`]; in memory only.
+    undo_stack: Vec<Snapshot>,
 }
 
 impl App {
@@ -226,6 +240,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Tasks,
             status: String::from(CONTROLS),
+            undo_stack: Vec::new(),
         };
         app.ensure_selection();
         app
@@ -275,7 +290,11 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Update {
-        match self.mode.clone() {
+        // Capture the pre-edit state, then keep it only if the key actually
+        // mutated something (signalled by `Update::Save`). Undo itself is
+        // handled outside this path, so it never records onto the stack.
+        let before = self.snapshot();
+        let update = match self.mode.clone() {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
@@ -284,6 +303,44 @@ impl App {
                 origin,
                 dest,
             } => self.handle_moving_key(key, src_ws, origin, dest),
+        };
+        if matches!(update, Update::Save) {
+            self.record_undo(before);
+        }
+        update
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            store: self.store.clone(),
+            selected_path: self.selected_path.clone(),
+        }
+    }
+
+    fn record_undo(&mut self, snapshot: Snapshot) {
+        self.undo_stack.push(snapshot);
+        if self.undo_stack.len() > UNDO_DEPTH {
+            // Drop the oldest entry so the history stays bounded.
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Restore the most recent pre-edit snapshot. Returns whether anything was
+    /// undone (so the caller can persist the reverted state).
+    pub fn undo(&mut self) -> bool {
+        match self.undo_stack.pop() {
+            Some(snapshot) => {
+                self.store = snapshot.store;
+                self.selected_path = snapshot.selected_path;
+                self.store.normalize();
+                self.ensure_selection();
+                self.status = format!("Undo • {} more available", self.undo_stack.len());
+                true
+            }
+            None => {
+                self.status = String::from("Nothing to undo");
+                false
+            }
         }
     }
 
@@ -457,11 +514,13 @@ impl App {
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
-                return if self.confirm_move(&origin, &anchor, as_child) {
-                    Update::Save
+                let dest_ws = self.store.selected_workspace;
+                let moved = if dest_ws == src_ws {
+                    self.confirm_move(&origin, &anchor, as_child)
                 } else {
-                    Update::None
+                    self.confirm_move_cross(src_ws, &origin, dest_ws, &anchor, as_child)
                 };
+                return if moved { Update::Save } else { Update::None };
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
@@ -482,11 +541,17 @@ impl App {
                     // Climb to the parent level.
                     anchor.truncate(anchor.len() - 1);
                 } else {
-                    // Already at the top level: jump out to workspace choice.
-                    return self.enter_workspace_dest(src_ws, origin);
+                    // Already at the top level: step back out to workspace
+                    // choice so a different workspace can be picked.
+                    return self.enter_workspace_dest(origin);
                 }
             }
-            KeyCode::Char('w') => return self.enter_workspace_dest(src_ws, origin),
+            KeyCode::Char('z') => {
+                // Fold/unfold the anchor item to navigate large trees while
+                // positioning; selection and drop target are unchanged.
+                self.toggle_fold();
+            }
+            KeyCode::Char('w') => return self.enter_workspace_dest(origin),
             _ => {}
         }
 
@@ -522,15 +587,14 @@ impl App {
                     Update::None
                 };
             }
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
-                self.move_workspace(-1)
-            }
+            // Up/Down picks which workspace; Left/Right move the item in and
+            // out of the highlighted workspace (they do NOT change workspace).
+            KeyCode::Up | KeyCode::Char('k') => self.move_workspace(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_workspace(1),
             KeyCode::Right | KeyCode::Char('l') => {
-                // Drop back into the source workspace's tree for precise placement.
-                if self.store.selected_workspace == src_ws
-                    && !self.current_workspace().items.is_empty()
-                {
+                // Step into the highlighted workspace's tree to position
+                // precisely — works for any workspace, not just the source.
+                if !self.current_workspace().items.is_empty() {
                     let anchor = vec![0];
                     self.focus = Focus::Tasks;
                     self.selected_path = Some(anchor.clone());
@@ -545,7 +609,11 @@ impl App {
                     };
                     return Update::None;
                 }
-                self.move_workspace(1);
+                // Empty workspace: nothing to position against — Enter drops in.
+                self.status = format!(
+                    "Workspace \"{}\" is empty • Enter to drop in • ↑/↓ pick • Esc",
+                    self.current_workspace().name
+                );
             }
             _ => {}
         }
@@ -560,9 +628,14 @@ impl App {
         Update::None
     }
 
-    fn enter_workspace_dest(&mut self, src_ws: usize, origin: Vec<usize>) -> Update {
+    fn enter_workspace_dest(&mut self, origin: Vec<usize>) -> Update {
+        let src_ws = match &self.mode {
+            Mode::Moving { src_ws, .. } => *src_ws,
+            _ => self.store.selected_workspace,
+        };
         self.focus = Focus::Workspaces;
-        self.store.selected_workspace = src_ws;
+        // Keep the currently-viewed workspace highlighted so the user can pick a
+        // different one with ↑/↓ — don't snap back to the source.
         self.status = self.move_workspace_status();
         self.mode = Mode::Moving {
             src_ws,
@@ -578,9 +651,9 @@ impl App {
             .map(|item| item.title.clone())
             .unwrap_or_default();
         if as_child {
-            format!("Move: nest under \"{target}\" • ← out • Enter confirm • Esc cancel")
+            format!("Move: nest under \"{target}\" • ← out • z fold • Enter • Esc")
         } else {
-            format!("Move: after \"{target}\" • → nest • ← parent/workspace • Enter • Esc")
+            format!("Move: after \"{target}\" • → nest • ← out • z fold • Enter • Esc")
         }
     }
 
@@ -616,6 +689,53 @@ impl App {
                 true
             }
             None => {
+                self.status = String::from("Move failed");
+                false
+            }
+        }
+    }
+
+    /// Move the item from `src_ws` at `origin` into a *different* workspace
+    /// `dest_ws`, placed relative to `target` (a path within `dest_ws`). No
+    /// self/subtree checks are needed since the two trees are distinct.
+    fn confirm_move_cross(
+        &mut self,
+        src_ws: usize,
+        origin: &[usize],
+        dest_ws: usize,
+        target: &[usize],
+        as_child: bool,
+    ) -> bool {
+        let Some(src) = self.store.workspaces.get_mut(src_ws) else {
+            self.status = String::from("Move failed");
+            return false;
+        };
+        let Some(moved) = take_at_path(&mut src.items, origin) else {
+            self.status = String::from("Move failed");
+            return false;
+        };
+
+        let Some(dest) = self.store.workspaces.get_mut(dest_ws) else {
+            // Destination vanished; put it back where it came from.
+            self.store.workspaces[src_ws].items.push(moved);
+            self.status = String::from("Move failed");
+            return false;
+        };
+
+        // Keep a copy so the item can be restored if the (rare) insert fails.
+        let restore = moved.clone();
+        match insert_relative(&mut dest.items, moved, target, as_child) {
+            Some((new_path, title)) => {
+                self.store.selected_workspace = dest_ws;
+                self.selected_path = Some(new_path);
+                self.focus = Focus::Tasks;
+                self.status =
+                    format!("Moved \"{title}\" to {}", self.store.workspaces[dest_ws].name);
+                true
+            }
+            None => {
+                // Insert target was invalid; restore the item to its source.
+                self.store.workspaces[src_ws].items.push(restore);
                 self.status = String::from("Move failed");
                 false
             }
@@ -864,17 +984,22 @@ impl App {
     }
 
     fn toggle_selected(&mut self) -> bool {
-        if let Some(item) = self.selected_item_mut() {
-            item.done = !item.done;
-            self.status = if item.done {
-                format!("Completed: {}", item.title)
-            } else {
-                format!("Reopened: {}", item.title)
-            };
-            true
+        let Some(item) = self.selected_item_mut() else {
+            return false;
+        };
+        // Completing or reopening a parent cascades to its whole subtree.
+        let new_done = !item.done;
+        let had_children = !item.children.is_empty();
+        set_done_recursive(item, new_done);
+        let title = item.title.clone();
+
+        let label = if new_done { "Completed" } else { "Reopened" };
+        self.status = if had_children {
+            format!("{label} \"{title}\" and its subtree")
         } else {
-            false
-        }
+            format!("{label}: {title}")
+        };
+        true
     }
 
     fn remove_selected(&mut self) -> bool {
@@ -969,6 +1094,14 @@ fn item_ref<'a>(items: &'a [TodoItem], path: &[usize]) -> Option<&'a TodoItem> {
     }
 }
 
+/// Set `done` on an item and every descendant in its subtree.
+fn set_done_recursive(item: &mut TodoItem, done: bool) {
+    item.done = done;
+    for child in &mut item.children {
+        set_done_recursive(child, done);
+    }
+}
+
 fn item_mut<'a>(items: &'a mut [TodoItem], path: &[usize]) -> Option<&'a mut TodoItem> {
     let (first, rest) = path.split_first()?;
     let item = items.get_mut(*first)?;
@@ -1030,17 +1163,29 @@ fn relocate(
     as_child: bool,
 ) -> Option<(Vec<usize>, String)> {
     let moved = take_at_path(items, origin)?;
+    insert_relative(items, moved, target_adj, as_child)
+}
+
+/// Insert `moved` into `items` relative to `target`: as the last child of the
+/// item at `target` when `as_child`, otherwise as the next sibling after it.
+/// Returns the inserted item's new path and title.
+fn insert_relative(
+    items: &mut Vec<TodoItem>,
+    moved: TodoItem,
+    target: &[usize],
+    as_child: bool,
+) -> Option<(Vec<usize>, String)> {
     let title = moved.title.clone();
 
     if as_child {
-        let parent = item_mut(items, target_adj)?;
+        let parent = item_mut(items, target)?;
         parent.folded = false;
         parent.children.push(moved);
-        let mut new_path = target_adj.to_vec();
+        let mut new_path = target.to_vec();
         new_path.push(parent.children.len() - 1);
         Some((new_path, title))
     } else {
-        let (&target_index, parent_path) = target_adj.split_last()?;
+        let (&target_index, parent_path) = target.split_last()?;
         let insert_index = target_index + 1;
         let list = list_mut(items, parent_path)?;
         let insert_index = insert_index.min(list.len());
@@ -1170,6 +1315,66 @@ mod tests {
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[1].title, "Child");
         assert_eq!(flat[1].depth, 1);
+    }
+
+    #[test]
+    fn completing_parent_cascades_to_subtree() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_child(String::from("Child"));
+        app.selected_path = Some(vec![0, 0]);
+        app.add_child(String::from("Grandchild")); // under Child
+        app.selected_path = Some(vec![0]); // back to Parent
+
+        // Completing the parent marks the whole subtree done.
+        assert!(app.toggle_selected());
+        let parent = &app.store.workspaces[0].items[0];
+        assert!(parent.done);
+        assert!(parent.children[0].done); // Child
+        assert!(parent.children[0].children[0].done); // Grandchild
+
+        // Reopening the parent clears the whole subtree again.
+        assert!(app.toggle_selected());
+        let parent = &app.store.workspaces[0].items[0];
+        assert!(!parent.done);
+        assert!(!parent.children[0].done);
+        assert!(!parent.children[0].children[0].done);
+    }
+
+    #[test]
+    fn undo_restores_state_before_last_edit() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_child(String::from("Child"));
+        app.selected_path = Some(vec![0]);
+
+        // Cascade-complete the subtree via the key path (so it records undo).
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.store.workspaces[0].items[0].done);
+        assert!(app.store.workspaces[0].items[0].children[0].done);
+
+        // Undo reverts the whole cascade in one step.
+        assert!(app.undo());
+        assert!(!app.store.workspaces[0].items[0].done);
+        assert!(!app.store.workspaces[0].items[0].children[0].done);
+
+        // Nothing left to undo (the test set up items directly, not via keys).
+        assert!(!app.undo());
+    }
+
+    #[test]
+    fn undo_history_is_bounded_to_twenty() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Task")); // gives us something to toggle
+        // 25 recorded edits; only the last 20 should be undoable.
+        for _ in 0..25 {
+            press(&mut app, KeyCode::Char('x'));
+        }
+        let mut undone = 0;
+        while app.undo() {
+            undone += 1;
+        }
+        assert_eq!(undone, UNDO_DEPTH);
     }
 
     fn press(app: &mut App, code: KeyCode) -> Update {
@@ -1362,6 +1567,75 @@ mod tests {
             }
         ));
         assert_eq!(app.focus, Focus::Workspaces);
+    }
+
+    #[test]
+    fn workspace_pane_picks_with_up_down_and_steps_in_with_right() {
+        let mut store = Store::default();
+        store.workspaces.push(Workspace::new("Other"));
+        store.workspaces[0].items.push(TodoItem::new("A"));
+        store.workspaces[1].items.push(TodoItem::new("X"));
+        let mut app = App::new(store);
+
+        app.selected_path = Some(vec![0]); // A in workspace 0
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Left); // top level → workspace choice
+        assert_eq!(app.store.selected_workspace, 0);
+
+        // Down picks the next workspace (does not move the item yet).
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.store.selected_workspace, 1);
+        assert!(matches!(
+            app.mode,
+            Mode::Moving {
+                dest: MoveDest::Workspace,
+                ..
+            }
+        ));
+
+        // Right steps into the highlighted (non-source) workspace's tree.
+        press(&mut app, KeyCode::Right);
+        assert!(matches!(
+            app.mode,
+            Mode::Moving {
+                dest: MoveDest::Item { .. },
+                ..
+            }
+        ));
+        assert_eq!(app.focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn cross_workspace_move_places_precisely() {
+        let mut store = Store::default();
+        store.workspaces.push(Workspace::new("Other"));
+        store.workspaces[0].items.push(TodoItem::new("A"));
+        store.workspaces[1].items.push(TodoItem::new("X"));
+        store.workspaces[1].items.push(TodoItem::new("Y"));
+        let mut app = App::new(store);
+
+        // Move "A" from workspace 0 to sit after "X" in workspace 1.
+        app.selected_path = Some(vec![0]);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Left); // out to workspace choice
+        press(&mut app, KeyCode::Down); // pick "Other"
+        press(&mut app, KeyCode::Right); // step in, anchor at X (index 0)
+        press(&mut app, KeyCode::Enter); // drop after X
+
+        // Source workspace no longer holds A.
+        assert!(app.store.workspaces[0].items.is_empty());
+        // Destination order is X, A, Y and we're now viewing it with A selected.
+        let titles: Vec<_> = app.store.workspaces[1]
+            .items
+            .iter()
+            .map(|item| item.title.clone())
+            .collect();
+        assert_eq!(titles, vec!["X", "A", "Y"]);
+        assert_eq!(app.store.selected_workspace, 1);
+        assert_eq!(
+            app.selected_item().map(|item| item.title.as_str()),
+            Some("A")
+        );
     }
 
     #[test]

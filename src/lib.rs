@@ -61,6 +61,10 @@ pub struct Workspace {
     /// `@default` is Google's alias for the account's default list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_tasklist: Option<String>,
+    /// When true, completed items (and their subtrees) are hidden from the
+    /// list. Toggled with `h`; persisted per workspace.
+    #[serde(default)]
+    pub hide_completed: bool,
 }
 
 impl Workspace {
@@ -69,6 +73,7 @@ impl Workspace {
             name: name.into(),
             items: Vec::new(),
             google_tasklist: None,
+            hide_completed: false,
         }
     }
 }
@@ -237,6 +242,8 @@ pub enum Mode {
     ConfirmDelete,
     /// Confirming "unfold every item in the current workspace".
     ConfirmUnfoldAll,
+    /// Confirming "delete every hidden (completed) item in this workspace".
+    ConfirmDeleteHidden,
     /// Confirming "turn on auto-sync" (only enabling needs confirmation).
     #[cfg(feature = "google")]
     ConfirmEnableAutoSync,
@@ -249,10 +256,10 @@ pub enum Mode {
 }
 
 #[cfg(not(feature = "google"))]
-pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • m move •⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • ? help";
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • h hide-done • H delete-hidden • m move • ⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • ? help";
 
 #[cfg(feature = "google")]
-pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • m move •⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • s sync • S auto-sync • ? help";
+pub const CONTROLS: &str = "q quit • ←/→ focus • ↑/↓ move • a add • o child • e rename • x toggle • z fold • Z unfold-all • h hide-done • H delete-hidden • m move • ⌃c copy • ⌃v paste • ⌃z undo • d delete • w workspace • s sync • S auto-sync • ? help";
 
 /// Which panel currently receives up/down navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,7 +337,8 @@ impl App {
     pub fn flattened_items(&self) -> Vec<FlatItem> {
         let mut flat = Vec::new();
         let mut path = Vec::new();
-        flatten_items(&self.current_workspace().items, 0, &mut path, &mut flat);
+        let ws = self.current_workspace();
+        flatten_items(&ws.items, ws.hide_completed, 0, &mut path, &mut flat);
         flat
     }
 
@@ -384,6 +392,7 @@ impl App {
             Mode::Editing { target, input } => self.handle_editing_key(key, target, input),
             Mode::ConfirmDelete => self.handle_confirm_delete_key(key),
             Mode::ConfirmUnfoldAll => self.handle_confirm_unfold_all_key(key),
+            Mode::ConfirmDeleteHidden => self.handle_confirm_delete_hidden_key(key),
             #[cfg(feature = "google")]
             Mode::ConfirmEnableAutoSync => self.handle_confirm_enable_auto_sync_key(key),
             Mode::Moving {
@@ -443,12 +452,28 @@ impl App {
                 self.move_up();
                 Update::None
             }
-            KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Left => {
                 self.set_focus(Focus::Workspaces);
                 Update::None
             }
-            KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Right => {
                 self.set_focus(Focus::Tasks);
+                Update::None
+            }
+            KeyCode::Char('h') => {
+                self.toggle_hide_completed();
+                Update::Save
+            }
+            KeyCode::Char('H') => {
+                let hidden = self.hidden_count();
+                if self.current_workspace().hide_completed && hidden > 0 {
+                    self.mode = Mode::ConfirmDeleteHidden;
+                    self.status = format!(
+                        "Delete all {hidden} hidden item(s) in this workspace? y/n (Enter = yes)"
+                    );
+                } else {
+                    self.status = String::from("No hidden items to delete");
+                }
                 Update::None
             }
             KeyCode::Tab => {
@@ -612,6 +637,26 @@ impl App {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.status = String::from("Unfold all canceled");
+                Update::None
+            }
+            _ => Update::None,
+        }
+    }
+
+    fn handle_confirm_delete_hidden_key(&mut self, key: KeyEvent) -> Update {
+        match key.code {
+            // Enter defaults to yes.
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                if self.delete_hidden() {
+                    Update::Save
+                } else {
+                    Update::None
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Delete hidden canceled");
                 Update::None
             }
             _ => Update::None,
@@ -1151,7 +1196,52 @@ impl App {
         changed
     }
 
+    /// Toggle hiding of completed items in the current workspace, then fix up
+    /// the selection in case the selected item just disappeared.
+    fn toggle_hide_completed(&mut self) -> bool {
+        let ws = self.current_workspace_mut();
+        ws.hide_completed = !ws.hide_completed;
+        let hidden = ws.hide_completed;
+        self.ensure_selection();
+        self.status = if hidden {
+            String::from("Hiding completed items")
+        } else {
+            String::from("Showing completed items")
+        };
+        true
+    }
+
+    /// Number of items currently hidden by the completed-filter (counts whole
+    /// subtrees under a completed item).
+    pub fn hidden_count(&self) -> usize {
+        count_hidden_completed(&self.current_workspace().items)
+    }
+
+    /// Delete every completed item (and its subtree) in the current workspace.
+    fn delete_hidden(&mut self) -> bool {
+        let before = count_items(&self.current_workspace().items);
+        remove_completed(&mut self.current_workspace_mut().items);
+        let removed = before - count_items(&self.current_workspace().items);
+        self.ensure_selection();
+        if removed > 0 {
+            self.status = format!("Deleted {removed} hidden item(s)");
+            true
+        } else {
+            self.status = String::from("No hidden items to delete");
+            false
+        }
+    }
+
     fn toggle_selected(&mut self) -> bool {
+        // Remember where the selected row sits, in case completing it hides it.
+        let old_meta = self.selected_path.clone().and_then(|path| {
+            self.flattened_items()
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.path == path)
+                .map(|(pos, item)| (pos, item.depth))
+        });
+
         let Some(item) = self.selected_item_mut() else {
             return false;
         };
@@ -1162,11 +1252,26 @@ impl App {
         let title = item.title.clone();
 
         let label = if new_done { "Completed" } else { "Reopened" };
-        self.status = if had_children {
+        let status = if had_children {
             format!("{label} \"{title}\" and its subtree")
         } else {
             format!("{label}: {title}")
         };
+
+        // If hiding is on, the just-completed item disappears from the list.
+        // Move the selection the same way deleting a row does, rather than
+        // letting it jump to the top.
+        let still_visible = self
+            .flattened_items()
+            .iter()
+            .any(|item| Some(&item.path) == self.selected_path.as_ref());
+        if !still_visible {
+            let flat = self.flattened_items();
+            self.selected_path =
+                old_meta.and_then(|(pos, depth)| select_after_vanish(&flat, pos, depth));
+            self.ensure_selection();
+        }
+        self.status = status;
         true
     }
 
@@ -1189,19 +1294,7 @@ impl App {
         if removed {
             let flat = self.flattened_items();
             self.selected_path = removed_meta
-                .and_then(|(pos, depth)| {
-                    let prev = pos.checked_sub(1).and_then(|index| flat.get(index));
-                    match flat.get(pos) {
-                        // The row sliding up belongs to a shallower level (higher
-                        // parentage) — climb to the previous row rather than jump
-                        // out to it. Falls back to that row if there's no previous.
-                        Some(next) if next.depth < depth => prev.or(Some(next)),
-                        Some(next) => Some(next),
-                        // Deleted the last row: settle on the one before it.
-                        None => prev,
-                    }
-                })
-                .map(|item| item.path.clone());
+                .and_then(|(pos, depth)| select_after_vanish(&flat, pos, depth));
             self.ensure_selection();
             self.status = String::from("Removed item");
         }
@@ -1223,11 +1316,16 @@ impl App {
 
 fn flatten_items(
     items: &[TodoItem],
+    hide_completed: bool,
     depth: usize,
     path: &mut Vec<usize>,
     flat: &mut Vec<FlatItem>,
 ) {
     for (index, item) in items.iter().enumerate() {
+        // When hiding completed items, skip a done item and its whole subtree.
+        if hide_completed && item.done {
+            continue;
+        }
         path.push(index);
         flat.push(FlatItem {
             path: path.clone(),
@@ -1238,10 +1336,55 @@ fn flatten_items(
             folded: item.folded,
         });
         if !item.folded {
-            flatten_items(&item.children, depth + 1, path, flat);
+            flatten_items(&item.children, hide_completed, depth + 1, path, flat);
         }
         path.pop();
     }
+}
+
+/// Count every node in the tree.
+fn count_items(items: &[TodoItem]) -> usize {
+    items
+        .iter()
+        .map(|item| 1 + count_items(&item.children))
+        .sum()
+}
+
+/// Count nodes that the completed-filter hides: each completed item plus its
+/// whole subtree (descend only through items that stay visible).
+fn count_hidden_completed(items: &[TodoItem]) -> usize {
+    items
+        .iter()
+        .map(|item| {
+            if item.done {
+                1 + count_items(&item.children)
+            } else {
+                count_hidden_completed(&item.children)
+            }
+        })
+        .sum()
+}
+
+/// Remove every completed item (and its subtree) from the tree.
+fn remove_completed(items: &mut Vec<TodoItem>) {
+    items.retain(|item| !item.done);
+    for item in items {
+        remove_completed(&mut item.children);
+    }
+}
+
+/// Pick the selection after the row that was at `pos` (depth `depth`) in the
+/// old flattened list vanished. `flat` is the new flattened list. The row that
+/// slides into `pos` is the natural pick, unless it belongs to a shallower
+/// level — then climb to the previous row rather than jump out to it.
+fn select_after_vanish(flat: &[FlatItem], pos: usize, depth: usize) -> Option<Vec<usize>> {
+    let prev = pos.checked_sub(1).and_then(|index| flat.get(index));
+    match flat.get(pos) {
+        Some(next) if next.depth < depth => prev.or(Some(next)),
+        Some(next) => Some(next),
+        None => prev,
+    }
+    .map(|item| item.path.clone())
 }
 
 fn list_mut<'a>(items: &'a mut Vec<TodoItem>, path: &[usize]) -> Option<&'a mut Vec<TodoItem>> {
@@ -1437,7 +1580,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
             "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→ or h/l  focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -1483,6 +1626,7 @@ mod tests {
                     sync: None,
                 }],
                 google_tasklist: None,
+                hide_completed: false,
             }],
             selected_workspace: 0,
             auto_sync: false,
@@ -1600,6 +1744,102 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert!(!app.store.workspaces[0].items[0].folded);
         assert!(!app.store.workspaces[0].items[1].folded);
+    }
+
+    #[test]
+    fn h_hides_and_unhides_completed_items() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Open"));
+        app.add_sibling(String::from("Done"));
+        app.selected_path = Some(vec![1]);
+        press(&mut app, KeyCode::Char('x')); // complete "Done"
+        assert_eq!(app.flattened_items().len(), 2);
+
+        // h hides completed → only "Open" remains visible.
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.current_workspace().hide_completed);
+        let visible: Vec<_> = app
+            .flattened_items()
+            .into_iter()
+            .map(|f| f.title)
+            .collect();
+        assert_eq!(visible, vec!["Open"]);
+        assert_eq!(app.hidden_count(), 1);
+
+        // h again shows them.
+        press(&mut app, KeyCode::Char('h'));
+        assert!(!app.current_workspace().hide_completed);
+        assert_eq!(app.flattened_items().len(), 2);
+    }
+
+    #[test]
+    fn hiding_completed_hides_whole_subtree() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Parent"));
+        app.add_child(String::from("Child"));
+        app.selected_path = Some(vec![0]);
+        press(&mut app, KeyCode::Char('x')); // cascade-completes Parent + Child
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.flattened_items().len(), 0); // both hidden
+        assert_eq!(app.hidden_count(), 2);
+    }
+
+    #[test]
+    fn completing_under_hide_keeps_highlight_in_place() {
+        let mut app = App::new(Store::default());
+        for title in ["A", "B", "C", "D"] {
+            app.add_sibling(String::from(title));
+        }
+        press(&mut app, KeyCode::Char('h')); // hide completed (none yet)
+
+        // Select "B" and complete it; it vanishes. Selection should land on
+        // "C" (the row that slides into B's spot), not jump to "A" at the top.
+        app.selected_path = Some(vec![1]);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.selected_item().map(|i| i.title.as_str()),
+            Some("C"),
+            "highlight should follow the deletion rule, not jump to top"
+        );
+
+        // Completing the last visible row settles on the previous one.
+        app.selected_path = Some(vec![3]); // "D"
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.selected_item().map(|i| i.title.as_str()), Some("C"));
+    }
+
+    #[test]
+    fn shift_h_confirms_then_deletes_hidden() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Open"));
+        app.add_sibling(String::from("Done"));
+        app.selected_path = Some(vec![1]);
+        press(&mut app, KeyCode::Char('x')); // complete "Done"
+        press(&mut app, KeyCode::Char('h')); // hide completed
+
+        // Shift+H opens the confirm dialog.
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(app.mode, Mode::ConfirmDeleteHidden);
+
+        // Enter (default yes) deletes the hidden item; "Open" survives.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        let remaining: Vec<_> = app.store.workspaces[0]
+            .items
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert_eq!(remaining, vec!["Open"]);
+    }
+
+    #[test]
+    fn shift_h_without_hidden_items_does_nothing() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Open"));
+        press(&mut app, KeyCode::Char('H')); // hide is off, nothing hidden
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status, "No hidden items to delete");
     }
 
     fn press(app: &mut App, code: KeyCode) -> Update {

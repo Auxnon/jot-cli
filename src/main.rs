@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
 fn main() -> io::Result<()> {
@@ -364,9 +364,19 @@ fn event_loop(
 }
 
 fn draw(frame: &mut Frame, app: &App) {
+    // Size the status bar to the help text so the (long) controls line wraps
+    // across as many rows as it needs, up to a cap, instead of being clipped.
+    let inner_width = frame.area().width.saturating_sub(2).max(1) as usize;
+    let control_rows = jot_cli::CONTROLS
+        .chars()
+        .count()
+        .div_ceil(inner_width)
+        .clamp(1, 4) as u16;
+    let status_height = control_rows + 2; // + top/bottom borders
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(status_height)])
         .split(frame.area());
 
     let columns = Layout::default()
@@ -501,7 +511,15 @@ fn draw(frame: &mut Frame, app: &App) {
         })
         .collect::<Vec<_>>();
 
-    let workspace_title = format!("Workspace: {}", app.current_workspace().name);
+    let workspace_title = if app.current_workspace().hide_completed {
+        format!(
+            "Workspace: {} ({} hidden)",
+            app.current_workspace().name,
+            app.hidden_count()
+        )
+    } else {
+        format!("Workspace: {}", app.current_workspace().name)
+    };
     frame.render_widget(
         List::new(workspace_items)
             .block(focus_block("Workspaces", workspaces_focused)),
@@ -516,13 +534,16 @@ fn draw(frame: &mut Frame, app: &App) {
         jot_cli::Mode::Normal
         | jot_cli::Mode::ConfirmDelete
         | jot_cli::Mode::ConfirmUnfoldAll
+        | jot_cli::Mode::ConfirmDeleteHidden
         | jot_cli::Mode::Moving { .. } => app.status.clone(),
         #[cfg(feature = "google")]
         jot_cli::Mode::ConfirmEnableAutoSync => app.status.clone(),
         jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
     };
     frame.render_widget(
-        Paragraph::new(status).block(Block::default().title("Status").borders(Borders::ALL)),
+        Paragraph::new(status)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Status").borders(Borders::ALL)),
         layout[1],
     );
 

@@ -253,6 +253,9 @@ pub enum Mode {
         origin: Vec<usize>,
         dest: MoveDest,
     },
+    /// Reordering workspaces: the workspace at `origin` previews moving to
+    /// index `target`. The actual reorder happens on Enter (cancel-safe).
+    MovingWorkspace { origin: usize, target: usize },
 }
 
 #[cfg(not(feature = "google"))]
@@ -400,6 +403,9 @@ impl App {
                 origin,
                 dest,
             } => self.handle_moving_key(key, src_ws, origin, dest),
+            Mode::MovingWorkspace { origin, target } => {
+                self.handle_moving_workspace_reorder_key(key, origin, target)
+            }
         };
         if matches!(update, Update::Save) {
             self.record_undo(before);
@@ -568,6 +574,21 @@ impl App {
                 }
             }
             KeyCode::Char('m') => {
+                // On the workspaces pane, `m` reorders workspaces; on the tasks
+                // pane it moves the selected item.
+                if self.focus == Focus::Workspaces {
+                    if self.store.workspaces.len() < 2 {
+                        self.status = String::from("Need at least two workspaces to reorder");
+                    } else {
+                        let origin = self.store.selected_workspace;
+                        self.mode = Mode::MovingWorkspace {
+                            origin,
+                            target: origin,
+                        };
+                        self.status = self.reorder_workspace_status(origin);
+                    }
+                    return Update::None;
+                }
                 match self.selected_path.clone() {
                     Some(origin) => {
                         self.focus = Focus::Tasks;
@@ -861,6 +882,53 @@ impl App {
     fn move_workspace_status(&self) -> String {
         let name = self.current_workspace().name.clone();
         format!("Move to workspace \"{name}\" • ↑/↓ pick • → into list • Enter • Esc")
+    }
+
+    fn reorder_workspace_status(&self, origin: usize) -> String {
+        let name = self
+            .store
+            .workspaces
+            .get(origin)
+            .map(|ws| ws.name.clone())
+            .unwrap_or_default();
+        format!("Reorder \"{name}\" • ↑/↓ move • Enter confirm • Esc cancel")
+    }
+
+    /// Drive workspace reordering. `target` only previews where the workspace
+    /// at `origin` will land; the vector isn't reordered until Enter, so Esc
+    /// leaves everything untouched.
+    fn handle_moving_workspace_reorder_key(
+        &mut self,
+        key: KeyEvent,
+        origin: usize,
+        mut target: usize,
+    ) -> Update {
+        let last = self.store.workspaces.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = String::from("Move canceled");
+                return Update::None;
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                if origin == target {
+                    self.status = String::from("Workspace left in place");
+                    return Update::None;
+                }
+                let ws = self.store.workspaces.remove(origin);
+                self.store.workspaces.insert(target, ws);
+                self.store.selected_workspace = target;
+                self.status = format!("Moved workspace to position {}", target + 1);
+                return Update::Save;
+            }
+            KeyCode::Up | KeyCode::Char('k') => target = target.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => target = (target + 1).min(last),
+            _ => {}
+        }
+        self.mode = Mode::MovingWorkspace { origin, target };
+        self.status = self.reorder_workspace_status(origin);
+        Update::None
     }
 
     fn confirm_move(&mut self, origin: &[usize], target: &[usize], as_child: bool) -> bool {
@@ -1580,7 +1648,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
             "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child)\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child), or reorder workspace on the workspaces pane\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -1840,6 +1908,89 @@ mod tests {
         press(&mut app, KeyCode::Char('H')); // hide is off, nothing hidden
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.status, "No hidden items to delete");
+    }
+
+    fn workspace_names(app: &App) -> Vec<String> {
+        app.store
+            .workspaces
+            .iter()
+            .map(|ws| ws.name.clone())
+            .collect()
+    }
+
+    fn three_workspace_app() -> App {
+        let mut store = Store::default();
+        store.workspaces = vec![
+            Workspace::new("A"),
+            Workspace::new("B"),
+            Workspace::new("C"),
+        ];
+        App::new(store)
+    }
+
+    #[test]
+    fn m_reorders_workspace_down_on_confirm() {
+        let mut app = three_workspace_app();
+        app.focus = Focus::Workspaces;
+        app.store.selected_workspace = 0; // moving "A"
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(app.mode, Mode::MovingWorkspace { .. }));
+        press(&mut app, KeyCode::Down); // target 1
+        press(&mut app, KeyCode::Down); // target 2
+        // Cancel-safe: nothing changed until Enter.
+        assert_eq!(workspace_names(&app), vec!["A", "B", "C"]);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(workspace_names(&app), vec!["B", "C", "A"]);
+        assert_eq!(app.store.selected_workspace, 2); // selection follows
+    }
+
+    #[test]
+    fn m_reorder_esc_cancels_without_change() {
+        let mut app = three_workspace_app();
+        app.focus = Focus::Workspaces;
+        app.store.selected_workspace = 2; // moving "C"
+
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(workspace_names(&app), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn workspace_reorder_is_undoable() {
+        let mut app = three_workspace_app();
+        app.focus = Focus::Workspaces;
+        app.store.selected_workspace = 0;
+
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(workspace_names(&app), vec!["B", "A", "C"]);
+
+        // Undo restores the original order (one step, not the preview state).
+        assert!(app.undo());
+        assert_eq!(workspace_names(&app), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn m_on_tasks_pane_still_moves_item() {
+        let mut app = three_workspace_app();
+        app.add_sibling(String::from("Task"));
+        app.focus = Focus::Tasks;
+        app.selected_path = Some(vec![0]);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(
+            app.mode,
+            Mode::Moving {
+                dest: MoveDest::Item { .. },
+                ..
+            }
+        ));
     }
 
     fn press(app: &mut App, code: KeyCode) -> Update {

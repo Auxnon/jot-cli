@@ -426,20 +426,41 @@ fn draw(frame: &mut Frame, app: &App) {
     // The ⇅ marker only makes sense while the source workspace is on screen.
     let origin_visible = move_src_ws == Some(app.store.selected_workspace);
 
-    let workspace_items = app
-        .store
-        .workspaces
+    // While reordering workspaces, preview the new order without mutating the
+    // store: the workspace at `origin` is shown at `target`, the rest shift.
+    let reorder = match &app.mode {
+        jot_cli::Mode::MovingWorkspace { origin, target } => Some((*origin, *target)),
+        _ => None,
+    };
+    let ws_count = app.store.workspaces.len();
+    let display_order: Vec<usize> = match reorder {
+        Some((origin, target)) => {
+            let mut order: Vec<usize> = (0..ws_count).collect();
+            let moved = order.remove(origin);
+            order.insert(target, moved);
+            order
+        }
+        None => (0..ws_count).collect(),
+    };
+
+    let workspace_items = display_order
         .iter()
-        .enumerate()
-        .map(|(index, workspace)| {
+        .map(|&index| {
+            let workspace = &app.store.workspaces[index];
             let label = format!("{} ({})", workspace.name, workspace.items.len());
-            let selected = index == app.store.selected_workspace;
+            let (selected, moving) = match reorder {
+                // Highlight (and mark) the workspace being moved.
+                Some((origin, _)) => (index == origin, index == origin),
+                None => (index == app.store.selected_workspace, false),
+            };
             let style = if selected {
                 selection_style(workspaces_focused)
             } else {
                 Style::default()
             };
-            if selected && choosing_workspace {
+            if moving {
+                ListItem::new(Line::from(Span::raw(format!("⇅ {label}")))).style(style)
+            } else if selected && choosing_workspace {
                 ListItem::new(Line::from(vec![
                     Span::raw(label),
                     Span::styled("  ← move here", hint_style),

@@ -223,6 +223,108 @@ pub enum EditTarget {
     NewSibling,
     NewChild,
     RenameSelected,
+    RenameWorkspace,
+}
+
+impl EditTarget {
+    /// Whether this edit produces a workspace name, which is capped at
+    /// [`WORKSPACE_NAME_MAX`] characters.
+    fn edits_workspace_name(&self) -> bool {
+        matches!(self, EditTarget::NewWorkspace | EditTarget::RenameWorkspace)
+    }
+}
+
+/// Longest allowed workspace name, in characters.
+pub const WORKSPACE_NAME_MAX: usize = 24;
+
+/// Text being typed in an edit dialog plus the cursor position, counted in
+/// characters (not bytes) so multi-byte input moves and deletes cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EditField {
+    pub text: String,
+    /// Char index in `0..=char_count()`; insertion happens at this position.
+    pub cursor: usize,
+}
+
+impl EditField {
+    /// A field pre-filled with `text`, cursor at the end.
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.chars().count();
+        Self { text, cursor }
+    }
+
+    pub fn char_count(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn byte_offset(&self, char_idx: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(idx, _)| idx)
+            .unwrap_or(self.text.len())
+    }
+
+    pub fn insert(&mut self, ch: char) {
+        let at = self.byte_offset(self.cursor);
+        self.text.insert(at, ch);
+        self.cursor += 1;
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        let at = self.byte_offset(self.cursor);
+        self.text.insert_str(at, s);
+        self.cursor += s.chars().count();
+    }
+
+    /// Remove the character before the cursor.
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = self.byte_offset(self.cursor - 1);
+        let end = self.byte_offset(self.cursor);
+        self.text.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    /// Remove the character under the cursor.
+    pub fn delete(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        let start = self.byte_offset(self.cursor);
+        let end = self.byte_offset(self.cursor + 1);
+        self.text.replace_range(start..end, "");
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_count());
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.char_count();
+    }
+
+    /// Split for rendering: text before the cursor, the character under it
+    /// (`None` when the cursor sits at the end), and the text after.
+    pub fn split_at_cursor(&self) -> (&str, Option<char>, &str) {
+        let (before, rest) = self.text.split_at(self.byte_offset(self.cursor));
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some(ch) => (before, Some(ch), chars.as_str()),
+            None => (before, None, ""),
+        }
+    }
 }
 
 /// Where a moved item will land.
@@ -238,7 +340,7 @@ pub enum MoveDest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    Editing { target: EditTarget, input: String },
+    Editing { target: EditTarget, input: EditField },
     ConfirmDelete,
     /// Confirming "unfold every item in the current workspace".
     ConfirmUnfoldAll,
@@ -362,13 +464,13 @@ impl App {
     pub fn paste(&mut self, content: String) {
         let sanitized = content.replace(['\n', '\r'], " ");
         if let Mode::Editing { input, .. } = &mut self.mode {
-            input.push_str(&sanitized);
+            input.insert_str(&sanitized);
             return;
         }
         self.focus = Focus::Tasks;
         self.mode = Mode::Editing {
             target: EditTarget::NewSibling,
-            input: sanitized.trim().to_string(),
+            input: EditField::new(sanitized.trim()),
         };
         self.status = String::from("Pasted — Enter to add item, Esc to cancel");
     }
@@ -492,7 +594,7 @@ impl App {
             KeyCode::Char('a') => {
                 self.mode = Mode::Editing {
                     target: EditTarget::NewSibling,
-                    input: String::new(),
+                    input: EditField::default(),
                 };
                 self.status = String::from("New item name");
                 Update::None
@@ -500,7 +602,7 @@ impl App {
             KeyCode::Char('o') => {
                 self.mode = Mode::Editing {
                     target: EditTarget::NewChild,
-                    input: String::new(),
+                    input: EditField::default(),
                 };
                 self.status = String::from("New child item name");
                 Update::None
@@ -509,7 +611,7 @@ impl App {
                 if self.focus == Focus::Workspaces {
                     self.mode = Mode::Editing {
                         target: EditTarget::NewWorkspace,
-                        input: String::new(),
+                        input: EditField::default(),
                     };
                     self.status = String::from("New workspace name");
                 } else {
@@ -519,15 +621,26 @@ impl App {
                 Update::None
             }
             KeyCode::Char('e') => {
-                let current_title = self
-                    .selected_item()
-                    .map(|item| item.title.clone())
-                    .unwrap_or_default();
-                self.mode = Mode::Editing {
-                    target: EditTarget::RenameSelected,
-                    input: current_title,
-                };
-                self.status = String::from("Rename selected item");
+                // Edit whatever the focused panel points at: the workspace's
+                // own name on the workspaces pane, the selected item's title
+                // on the tasks pane.
+                if self.focus == Focus::Workspaces {
+                    self.mode = Mode::Editing {
+                        target: EditTarget::RenameWorkspace,
+                        input: EditField::new(self.current_workspace().name.clone()),
+                    };
+                    self.status = String::from("Rename workspace");
+                } else {
+                    let current_title = self
+                        .selected_item()
+                        .map(|item| item.title.clone())
+                        .unwrap_or_default();
+                    self.mode = Mode::Editing {
+                        target: EditTarget::RenameSelected,
+                        input: EditField::new(current_title),
+                    };
+                    self.status = String::from("Rename selected item");
+                }
                 Update::None
             }
             KeyCode::Char('x') | KeyCode::Char(' ') => {
@@ -1047,20 +1160,27 @@ impl App {
         &mut self,
         key: KeyEvent,
         target: EditTarget,
-        mut input: String,
+        mut input: EditField,
     ) -> Update {
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.status = String::from("Canceled");
-                Update::None
+                return Update::None;
             }
             KeyCode::Enter => {
-                let value = input.trim().to_string();
+                let mut value = input.text.trim().to_string();
                 self.mode = Mode::Normal;
                 if value.is_empty() {
                     self.status = String::from("Ignored empty input");
                     return Update::None;
+                }
+                if target.edits_workspace_name() {
+                    // Backstop for input that bypassed the typing cap (paste,
+                    // pre-limit names prefilled into the rename dialog).
+                    value = truncate_chars(&value, WORKSPACE_NAME_MAX)
+                        .trim_end()
+                        .to_string();
                 }
 
                 let changed = match target {
@@ -1068,26 +1188,31 @@ impl App {
                     EditTarget::NewSibling => self.add_sibling(value),
                     EditTarget::NewChild => self.add_child(value),
                     EditTarget::RenameSelected => self.rename_selected(value),
+                    EditTarget::RenameWorkspace => self.rename_workspace(value),
                 };
 
-                if changed { Update::Save } else { Update::None }
+                return if changed { Update::Save } else { Update::None };
             }
-            KeyCode::Backspace => {
-                input.pop();
-                self.mode = Mode::Editing { target, input };
-                Update::None
-            }
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Delete => input.delete(),
+            KeyCode::Left => input.move_left(),
+            KeyCode::Right => input.move_right(),
+            KeyCode::Home => input.move_home(),
+            KeyCode::End => input.move_end(),
             KeyCode::Char(ch) => {
-                input.push(ch);
-                self.mode = Mode::Editing { target, input };
-                Update::None
+                let at_cap = target.edits_workspace_name()
+                    && input.char_count() >= WORKSPACE_NAME_MAX;
+                if at_cap {
+                    self.status = format!("Workspace names max {WORKSPACE_NAME_MAX} characters");
+                } else {
+                    input.insert(ch);
+                }
             }
-            _ => {
-                // Preserve the in-progress input for any unhandled key.
-                self.mode = Mode::Editing { target, input };
-                Update::None
-            }
+            // Any other key just preserves the in-progress input.
+            _ => {}
         }
+        self.mode = Mode::Editing { target, input };
+        Update::None
     }
 
     fn ensure_selection(&mut self) {
@@ -1224,6 +1349,12 @@ impl App {
         } else {
             false
         }
+    }
+
+    fn rename_workspace(&mut self, name: String) -> bool {
+        self.current_workspace_mut().name = name.clone();
+        self.status = format!("Renamed workspace: {name}");
+        true
     }
 
     fn toggle_fold(&mut self) -> bool {
@@ -1411,6 +1542,11 @@ fn flatten_items(
 }
 
 /// Count every node in the tree.
+/// First `max` characters of `s` (not bytes — names can hold any UTF-8).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 fn count_items(items: &[TodoItem]) -> usize {
     items
         .iter()
@@ -1648,7 +1784,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
             "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child), or reorder workspace on the workspaces pane\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item, or the workspace on the workspaces pane\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child), or reorder workspace on the workspaces pane\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -2006,13 +2142,13 @@ mod tests {
         press(&mut app, KeyCode::Char('i'));
 
         match &app.mode {
-            Mode::Editing { input, .. } => assert_eq!(input, "Hi"),
+            Mode::Editing { input, .. } => assert_eq!(input.text, "Hi"),
             other => panic!("expected editing mode, got {other:?}"),
         }
 
         press(&mut app, KeyCode::Backspace);
         match &app.mode {
-            Mode::Editing { input, .. } => assert_eq!(input, "H"),
+            Mode::Editing { input, .. } => assert_eq!(input.text, "H"),
             other => panic!("expected editing mode, got {other:?}"),
         }
 
@@ -2302,6 +2438,150 @@ mod tests {
     }
 
     #[test]
+    fn e_on_workspaces_pane_renames_workspace() {
+        let mut app = App::new(Store::default());
+        let original = app.current_workspace().name.clone();
+
+        app.focus = Focus::Workspaces;
+        press(&mut app, KeyCode::Char('e'));
+        match &app.mode {
+            Mode::Editing {
+                target: EditTarget::RenameWorkspace,
+                input,
+            } => assert_eq!(input.text, original),
+            other => panic!("expected workspace rename dialog, got {other:?}"),
+        }
+
+        // Wipe the prefill and type a new name.
+        for _ in 0..original.chars().count() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for ch in "Errands".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.current_workspace().name, "Errands");
+    }
+
+    #[test]
+    fn e_on_tasks_pane_still_renames_item() {
+        let mut app = App::new(Store::default());
+        app.add_sibling(String::from("Task"));
+        app.focus = Focus::Tasks;
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            app.mode,
+            Mode::Editing {
+                target: EditTarget::RenameSelected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn workspace_name_typing_stops_at_cap() {
+        let mut app = App::new(Store::default());
+        app.focus = Focus::Workspaces;
+        press(&mut app, KeyCode::Char('w'));
+
+        for _ in 0..(WORKSPACE_NAME_MAX + 10) {
+            press(&mut app, KeyCode::Char('x'));
+        }
+        match &app.mode {
+            Mode::Editing { input, .. } => {
+                assert_eq!(input.char_count(), WORKSPACE_NAME_MAX);
+            }
+            other => panic!("expected editing mode, got {other:?}"),
+        }
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.current_workspace().name.chars().count(),
+            WORKSPACE_NAME_MAX
+        );
+    }
+
+    #[test]
+    fn workspace_name_pasted_past_cap_is_truncated_on_enter() {
+        let mut app = App::new(Store::default());
+        app.focus = Focus::Workspaces;
+        press(&mut app, KeyCode::Char('w'));
+        app.paste("a".repeat(WORKSPACE_NAME_MAX + 5));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.current_workspace().name,
+            "a".repeat(WORKSPACE_NAME_MAX)
+        );
+    }
+
+    #[test]
+    fn item_titles_are_not_length_capped() {
+        let mut app = App::new(Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        for _ in 0..(WORKSPACE_NAME_MAX + 10) {
+            press(&mut app, KeyCode::Char('y'));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.selected_item().map(|item| item.title.chars().count()),
+            Some(WORKSPACE_NAME_MAX + 10)
+        );
+    }
+
+    #[test]
+    fn editing_cursor_moves_and_inserts_mid_text() {
+        let mut app = App::new(Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+
+        // Left moves the cursor between 'a' and 'b'; typing inserts there.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('c'));
+        match &app.mode {
+            Mode::Editing { input, .. } => {
+                assert_eq!(input.text, "acb");
+                assert_eq!(input.cursor, 2);
+            }
+            other => panic!("expected editing mode, got {other:?}"),
+        }
+
+        // Backspace removes the char before the cursor ('c'), Delete the one
+        // under it ('b'), Home/End jump to the extremes.
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Char('z'));
+        match &app.mode {
+            Mode::Editing { input, .. } => {
+                assert_eq!(input.text, "za");
+                assert_eq!(input.cursor, 1);
+            }
+            other => panic!("expected editing mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_field_handles_multibyte_chars() {
+        let mut field = EditField::new("héllo");
+        assert_eq!(field.cursor, 5);
+        field.move_left();
+        field.move_left();
+        field.move_left();
+        field.move_left();
+        field.delete(); // removes 'é'
+        assert_eq!(field.text, "hllo");
+        field.insert('ü');
+        assert_eq!(field.text, "hüllo");
+        assert_eq!(field.cursor, 2);
+    }
+
+    #[test]
     fn copy_selected_returns_title() {
         let mut app = App::new(Store::default());
         app.add_sibling(String::from("Buy milk"));
@@ -2325,7 +2605,7 @@ mod tests {
             Mode::Editing {
                 target: EditTarget::NewSibling,
                 input,
-            } => assert_eq!(input, "Pasted task"),
+            } => assert_eq!(input.text, "Pasted task"),
             other => panic!("expected add dialog, got {other:?}"),
         }
 
@@ -2344,7 +2624,7 @@ mod tests {
         app.paste(String::from("ello\nworld"));
 
         match &app.mode {
-            Mode::Editing { input, .. } => assert_eq!(input, "Hello world"),
+            Mode::Editing { input, .. } => assert_eq!(input.text, "Hello world"),
             other => panic!("expected editing mode, got {other:?}"),
         }
     }

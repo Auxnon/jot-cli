@@ -176,7 +176,7 @@ fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
         },
     )?;
 
-    let mut input = String::new();
+    let mut input = jot_cli::EditField::default();
     let blink = Duration::from_millis(500);
     let mut last_blink = Instant::now();
     let mut cursor_on = true;
@@ -189,7 +189,7 @@ fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
     let outcome = loop {
         terminal.draw(|frame| {
             let mut spans = vec![Span::styled("> ", prompt_style)];
-            if input.is_empty() {
+            if input.text.is_empty() {
                 // Cursor sits over the first placeholder character.
                 let mut chars = placeholder.chars();
                 match chars.next() {
@@ -206,9 +206,16 @@ fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
                     None => {}
                 }
             } else {
-                spans.push(Span::raw(input.clone()));
-                if cursor_on {
-                    spans.push(Span::styled(" ", cursor_style));
+                let (before, at, after) = input.split_at_cursor();
+                spans.push(Span::raw(before.to_string()));
+                match at {
+                    Some(ch) => {
+                        let style = if cursor_on { cursor_style } else { Style::default() };
+                        spans.push(Span::styled(ch.to_string(), style));
+                        spans.push(Span::raw(after.to_string()));
+                    }
+                    None if cursor_on => spans.push(Span::styled(" ", cursor_style)),
+                    None => {}
                 }
             }
             frame.render_widget(Paragraph::new(Line::from(spans)), frame.area());
@@ -218,20 +225,40 @@ fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Enter => break Some(input.trim().to_string()),
+                    KeyCode::Enter => break Some(input.text.trim().to_string()),
                     KeyCode::Esc => break None,
                     KeyCode::Backspace => {
-                        input.pop();
+                        input.backspace();
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    KeyCode::Delete => {
+                        input.delete();
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    KeyCode::Left => {
+                        input.move_left();
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    KeyCode::Right => {
+                        input.move_right();
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    KeyCode::Home => {
+                        input.move_home();
+                        wake(&mut cursor_on, &mut last_blink);
+                    }
+                    KeyCode::End => {
+                        input.move_end();
                         wake(&mut cursor_on, &mut last_blink);
                     }
                     KeyCode::Char(ch) => {
-                        input.push(ch);
+                        input.insert(ch);
                         wake(&mut cursor_on, &mut last_blink);
                     }
                     _ => {}
                 },
                 Event::Paste(content) => {
-                    input.push_str(&content.replace(['\n', '\r'], " "));
+                    input.insert_str(&content.replace(['\n', '\r'], " "));
                     wake(&mut cursor_on, &mut last_blink);
                 }
                 _ => {}
@@ -366,7 +393,7 @@ fn event_loop(
 /// The text shown in the status bar for the current mode.
 fn status_text(app: &App) -> String {
     match &app.mode {
-        jot_cli::Mode::Editing { input, .. } => format!("Input: {input}"),
+        jot_cli::Mode::Editing { input, .. } => format!("Input: {}", input.text),
         _ => app.status.clone(),
     }
 }
@@ -575,12 +602,26 @@ fn draw(frame: &mut Frame, app: &App) {
             jot_cli::EditTarget::NewSibling => "New item",
             jot_cli::EditTarget::NewChild => "New child item",
             jot_cli::EditTarget::RenameSelected => "Rename item",
+            jot_cli::EditTarget::RenameWorkspace => "Rename workspace",
         };
+
+        // A block cursor: the character under it renders inverted (a plain
+        // space when the cursor sits at the end of the input).
+        let cursor_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        let (before, at, after) = input.split_at_cursor();
+        let mut spans = vec![Span::raw(before.to_string())];
+        match at {
+            Some(ch) => {
+                spans.push(Span::styled(ch.to_string(), cursor_style));
+                spans.push(Span::raw(after.to_string()));
+            }
+            None => spans.push(Span::styled(" ", cursor_style)),
+        }
 
         let popup = centered_rect(frame.area(), 60, 20);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(input.clone())
+            Paragraph::new(Line::from(spans))
                 .block(Block::default().title(prompt).borders(Borders::ALL)),
             popup,
         );

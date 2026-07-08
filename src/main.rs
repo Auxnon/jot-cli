@@ -13,14 +13,14 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
 };
-use jot_cli::{App, CliArgs, Focus, Mode, Update, parse_args};
+use jot_cli::{App, CliArgs, Focus, Mode, Update, parse_args, wrap_words};
 use ratatui::{
     DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 fn main() -> io::Result<()> {
@@ -318,6 +318,10 @@ fn event_loop(
     let mut last_tick = Instant::now();
 
     loop {
+        // Tell the app how wide the editing dialog currently is, so Up/Down
+        // in a dialog move the cursor by exactly one wrapped row.
+        app.set_edit_wrap_width(modal_inner_width(terminal.size()?.width));
+
         terminal.draw(|frame| draw(frame, app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -470,11 +474,11 @@ fn draw(frame: &mut Frame, app: &App) {
         None => (0..ws_count).collect(),
     };
 
+    let ws_inner_width = columns[0].width.saturating_sub(2) as usize;
     let workspace_items = display_order
         .iter()
         .map(|&index| {
             let workspace = &app.store.workspaces[index];
-            let label = format!("{} ({})", workspace.name, workspace.items.len());
             let (selected, moving) = match reorder {
                 // Highlight (and mark) the workspace being moved.
                 Some((origin, _)) => (index == origin, index == origin),
@@ -485,23 +489,27 @@ fn draw(frame: &mut Frame, app: &App) {
             } else {
                 Style::default()
             };
-            if moving {
-                ListItem::new(Line::from(Span::raw(format!("⇅ {label}")))).style(style)
-            } else if selected && choosing_workspace {
-                ListItem::new(Line::from(vec![
-                    Span::raw(label),
-                    Span::styled("  ← move here", hint_style),
-                ]))
-                .style(style)
-            } else {
-                ListItem::new(label).style(style)
+            let marker = if moving { "⇅ " } else { "" };
+            let label = format!("{marker}{} ({})", workspace.name, workspace.items.len());
+
+            // Long names wrap; the item keeps its style across every line.
+            let mut lines: Vec<Line> = wrap_words(&label, ws_inner_width)
+                .into_iter()
+                .map(|line| Line::from(Span::raw(line)))
+                .collect();
+            if selected && choosing_workspace
+                && let Some(last) = lines.last_mut()
+            {
+                last.spans.push(Span::styled("  ← move here", hint_style));
             }
+            ListItem::new(Text::from(lines)).style(style)
         })
         .collect::<Vec<_>>();
 
-    let items = app
-        .flattened_items()
-        .into_iter()
+    let flat = app.flattened_items();
+    let tasks_inner_width = columns[1].width.saturating_sub(2) as usize;
+    let items = flat
+        .iter()
         .map(|item| {
             let indent = "  ".repeat(item.depth);
             let selected = app.selected_path.as_ref() == Some(&item.path);
@@ -549,24 +557,39 @@ fn draw(frame: &mut Frame, app: &App) {
                 Style::default()
             };
 
-            let mut spans = vec![
+            // Word-wrap the title to the pane; continuation lines hang under
+            // the first title character, past the indent/glyph/symbol head.
+            let head_width = item.depth * 2 + 4;
+            let title_width = tasks_inner_width.saturating_sub(head_width).max(1);
+            let wrapped = wrap_words(&item.title, title_width);
+
+            let mut lines = vec![Line::from(vec![
                 Span::raw(format!("{indent}{lead} ")),
                 Span::styled(symbol, symbol_style),
-                Span::styled(format!(" {}", item.title), title_style),
-            ];
+                Span::styled(format!(" {}", wrapped[0]), title_style),
+            ])];
+            for continuation in wrapped.iter().skip(1) {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(head_width)),
+                    Span::styled(continuation.clone(), title_style),
+                ]));
+            }
 
             // While moving within the tree, the selected row is the drop target.
             // Show where the item will land, with an arrow when it nests.
-            if selected && let Some(as_child) = move_item_dest {
+            if selected
+                && let Some(as_child) = move_item_dest
+                && let Some(last) = lines.last_mut()
+            {
                 let hint = if as_child {
                     "  ↳ as child"
                 } else {
                     "  ← insert after"
                 };
-                spans.push(Span::styled(hint, hint_style));
+                last.spans.push(Span::styled(hint, hint_style));
             }
 
-            ListItem::new(Line::from(spans)).style(row_style)
+            ListItem::new(Text::from(lines)).style(row_style)
         })
         .collect::<Vec<_>>();
 
@@ -579,14 +602,32 @@ fn draw(frame: &mut Frame, app: &App) {
     } else {
         format!("Workspace: {}", app.current_workspace().name)
     };
-    frame.render_widget(
-        List::new(workspace_items)
-            .block(focus_block("Workspaces", workspaces_focused)),
+    // Stateful rendering scrolls each pane so the selected (multi-line) item
+    // stays fully visible now that wrapped items can outgrow the viewport.
+    let selected_ws_row = match reorder {
+        Some((_, target)) => Some(target),
+        None => display_order
+            .iter()
+            .position(|&index| index == app.store.selected_workspace),
+    };
+    let mut ws_state = ListState::default();
+    ws_state.select(selected_ws_row);
+    frame.render_stateful_widget(
+        List::new(workspace_items).block(focus_block("Workspaces", workspaces_focused)),
         columns[0],
+        &mut ws_state,
     );
-    frame.render_widget(
+
+    let selected_task_row = app
+        .selected_path
+        .as_ref()
+        .and_then(|path| flat.iter().position(|item| &item.path == path));
+    let mut task_state = ListState::default();
+    task_state.select(selected_task_row);
+    frame.render_stateful_widget(
         List::new(items).block(focus_block(workspace_title, tasks_focused)),
         columns[1],
+        &mut task_state,
     );
 
     frame.render_widget(
@@ -608,24 +649,80 @@ fn draw(frame: &mut Frame, app: &App) {
         // A block cursor: the character under it renders inverted (a plain
         // space when the cursor sits at the end of the input).
         let cursor_style = Style::default().fg(Color::Black).bg(Color::Cyan);
-        let (before, at, after) = input.split_at_cursor();
-        let mut spans = vec![Span::raw(before.to_string())];
-        match at {
-            Some(ch) => {
-                spans.push(Span::styled(ch.to_string(), cursor_style));
-                spans.push(Span::raw(after.to_string()));
-            }
-            None => spans.push(Span::styled(" ", cursor_style)),
-        }
 
-        let popup = centered_rect(frame.area(), 60, 20);
+        // Hard-wrap the text at the dialog's inner width — the exact width
+        // the event loop reported to the app, so Up/Down land where drawn.
+        let area = frame.area();
+        let inner_width = modal_inner_width(area.width);
+        let mut cells: Vec<(char, bool)> = input
+            .text
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| (ch, i == input.cursor))
+            .collect();
+        if input.cursor >= cells.len() {
+            cells.push((' ', true));
+        }
+        let lines: Vec<Line> = cells
+            .chunks(inner_width)
+            .map(|row| {
+                let mut spans = Vec::new();
+                let mut run = String::new();
+                for &(ch, under_cursor) in row {
+                    if under_cursor {
+                        if !run.is_empty() {
+                            spans.push(Span::raw(std::mem::take(&mut run)));
+                        }
+                        spans.push(Span::styled(ch.to_string(), cursor_style));
+                    } else {
+                        run.push(ch);
+                    }
+                }
+                if !run.is_empty() {
+                    spans.push(Span::raw(run));
+                }
+                Line::from(spans)
+            })
+            .collect();
+
+        // The dialog grows with the text up to most of the screen; past that
+        // the wrapped text scrolls to keep the cursor's row visible.
+        let max_rows = area.height.saturating_sub(4).max(1);
+        let visible_rows = (lines.len() as u16).clamp(1, max_rows);
+        let cursor_row = (input.cursor / inner_width) as u16;
+        let scroll = cursor_row.saturating_sub(visible_rows - 1);
+
+        let popup = popup_rect(area, inner_width as u16 + 2, visible_rows + 2);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(Line::from(spans))
+            Paragraph::new(Text::from(lines))
+                .scroll((scroll, 0))
                 .block(Block::default().title(prompt).borders(Borders::ALL)),
             popup,
         );
     }
+}
+
+/// Characters per row inside the editing dialog at this terminal width. The
+/// event loop reports it to the app so Up/Down move the cursor by exactly one
+/// rendered row.
+fn modal_inner_width(terminal_width: u16) -> usize {
+    let popup_width = (terminal_width as usize * 60 / 100)
+        .max(20)
+        .min(terminal_width as usize);
+    popup_width.saturating_sub(2).max(1)
+}
+
+/// A rect of the given size centered in `area`, clamped to fit.
+fn popup_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 
 /// Highlight the selected row; brighter when its panel currently has focus.
@@ -655,26 +752,83 @@ fn focus_block(title: impl Into<String>, focused: bool) -> Block<'static> {
         .border_style(border_style)
 }
 
-fn centered_rect(
-    area: ratatui::layout::Rect,
-    width_percent: u16,
-    height_percent: u16,
-) -> ratatui::layout::Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_percent) / 2),
-            Constraint::Percentage(height_percent),
-            Constraint::Percentage((100 - height_percent) / 2),
-        ])
-        .split(area);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_percent) / 2),
-            Constraint::Percentage(width_percent),
-            Constraint::Percentage((100 - width_percent) / 2),
-        ])
-        .split(vertical[1])[1]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code));
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    /// Render the app into a test buffer and return it as one string per row.
+    fn render(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn long_task_titles_word_wrap_in_the_list() {
+        let mut app = App::new(jot_cli::Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "aaaa bbbb cccc");
+        press(&mut app, KeyCode::Enter);
+
+        // Tasks pane at width 40: 40 - 24 (workspaces) - 2 (borders) = 14
+        // columns, minus the 4-column head = a 10-wide title. "aaaa bbbb"
+        // fits the first line; "cccc" hangs underneath, aligned to the title.
+        let rows = render(&app, 40, 10);
+        let first = rows
+            .iter()
+            .position(|row| row.contains("aaaa bbbb"))
+            .expect("wrapped first line shown");
+        assert!(!rows[first].contains("cccc"), "title should have wrapped");
+        assert!(rows[first + 1].contains("cccc"));
+    }
+
+    #[test]
+    fn editing_dialog_wraps_long_input() {
+        let mut app = App::new(jot_cli::Store::default());
+        app.set_edit_wrap_width(modal_inner_width(40));
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, &"x".repeat(60));
+
+        // 60 chars in a 22-wide dialog (40 * 60% - borders) span three rows.
+        let rows = render(&app, 40, 12);
+        let wrapped_rows = rows
+            .iter()
+            .filter(|row| row.contains("xxxxxxxxxx"))
+            .count();
+        assert!(
+            wrapped_rows >= 2,
+            "dialog input should wrap across rows, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn tiny_terminals_do_not_panic() {
+        let mut app = App::new(jot_cli::Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "a task that is long enough to wrap many times");
+        render(&app, 10, 4);
+        render(&app, 3, 2);
+        press(&mut app, KeyCode::Enter);
+        render(&app, 10, 4);
+    }
 }

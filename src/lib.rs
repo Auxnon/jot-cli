@@ -315,6 +315,24 @@ impl EditField {
         self.cursor = self.char_count();
     }
 
+    /// Move up one visual row when the text is hard-wrapped at `width`
+    /// characters per line; on the first row the cursor jumps to the start.
+    pub fn move_up(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        self.cursor = self.cursor.saturating_sub(width);
+    }
+
+    /// Move down one visual row under the same hard-wrap; past the last row
+    /// the cursor lands at the end.
+    pub fn move_down(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        self.cursor = (self.cursor + width).min(self.char_count());
+    }
+
     /// Split for rendering: text before the cursor, the character under it
     /// (`None` when the cursor sits at the end), and the text after.
     pub fn split_at_cursor(&self) -> (&str, Option<char>, &str) {
@@ -414,6 +432,10 @@ pub struct App {
     /// Bounded history of pre-edit snapshots, newest last. Capped at
     /// [`UNDO_DEPTH`]; in memory only.
     undo_stack: Vec<Snapshot>,
+    /// How many characters fit on one line of the editing dialog. The render
+    /// side reports it (it depends on the terminal size) so Up/Down can move
+    /// the cursor by exactly one visual row.
+    edit_wrap_width: usize,
 }
 
 impl App {
@@ -426,6 +448,7 @@ impl App {
             focus: Focus::Tasks,
             status: String::from(CONTROLS),
             undo_stack: Vec::new(),
+            edit_wrap_width: 40,
         };
         app.ensure_selection();
         app
@@ -478,6 +501,11 @@ impl App {
     /// Replace the status line text (used by the event loop after a sync).
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    /// Report the editing dialog's inner width so Up/Down move by visual row.
+    pub fn set_edit_wrap_width(&mut self, width: usize) {
+        self.edit_wrap_width = width.max(1);
     }
 
     /// Re-validate selection after a sync may have added or removed items.
@@ -1197,6 +1225,8 @@ impl App {
             KeyCode::Delete => input.delete(),
             KeyCode::Left => input.move_left(),
             KeyCode::Right => input.move_right(),
+            KeyCode::Up => input.move_up(self.edit_wrap_width),
+            KeyCode::Down => input.move_down(self.edit_wrap_width),
             KeyCode::Home => input.move_home(),
             KeyCode::End => input.move_end(),
             KeyCode::Char(ch) => {
@@ -1545,6 +1575,51 @@ fn flatten_items(
 /// First `max` characters of `s` (not bytes — names can hold any UTF-8).
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// Word-wrap `text` into lines of at most `width` characters. Breaks at
+/// spaces; a single word longer than `width` is hard-split. Always returns at
+/// least one line so callers can render empty titles.
+pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current_len > 0 && current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else if current_len == 0 && word_len <= width {
+            current.push_str(word);
+            current_len = word_len;
+        } else {
+            // The word doesn't fit next to the current line. Flush, then
+            // hard-split it if it can't fit on a line of its own.
+            if current_len > 0 {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut rest: &str = word;
+            while rest.chars().count() > width {
+                let split = rest
+                    .char_indices()
+                    .nth(width)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(rest.len());
+                lines.push(rest[..split].to_string());
+                rest = &rest[split..];
+            }
+            current.push_str(rest);
+            current_len = rest.chars().count();
+        }
+    }
+
+    if current_len > 0 || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn count_items(items: &[TodoItem]) -> usize {
@@ -2564,6 +2639,58 @@ mod tests {
             }
             other => panic!("expected editing mode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wrap_words_breaks_at_word_boundaries() {
+        assert_eq!(
+            wrap_words("buy milk and also eggs", 10),
+            vec!["buy milk", "and also", "eggs"]
+        );
+    }
+
+    #[test]
+    fn wrap_words_hard_splits_long_words() {
+        assert_eq!(
+            wrap_words("see https://example.com/really-long", 12),
+            vec!["see", "https://exam", "ple.com/real", "ly-long"]
+        );
+    }
+
+    #[test]
+    fn wrap_words_short_text_is_one_line() {
+        assert_eq!(wrap_words("hi", 10), vec!["hi"]);
+        assert_eq!(wrap_words("", 10), vec![""]);
+    }
+
+    #[test]
+    fn editing_up_down_move_by_wrap_width() {
+        let mut app = App::new(Store::default());
+        app.set_edit_wrap_width(5);
+
+        press(&mut app, KeyCode::Char('a'));
+        for ch in "abcdefghijkl".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        // Cursor starts at the end (12); Up climbs a row at a time, pinning
+        // to the start on the first row; Down descends and pins to the end.
+        let cursor = |app: &App| match &app.mode {
+            Mode::Editing { input, .. } => input.cursor,
+            other => panic!("expected editing mode, got {other:?}"),
+        };
+        assert_eq!(cursor(&app), 12);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(cursor(&app), 7);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(cursor(&app), 2);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(cursor(&app), 0);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor(&app), 5);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor(&app), 12);
     }
 
     #[test]

@@ -26,6 +26,14 @@ pub struct TodoItem {
     /// feature is compiled in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncMeta>,
+    /// Stable identity used to match this item across concurrent sessions.
+    /// 0 = not yet assigned (legacy file); `normalize` fills it in.
+    #[serde(default)]
+    pub id: u64,
+    /// Unix-millisecond time of the last edit to this item's own fields
+    /// (title, done, folded, position). Newest copy wins on merge.
+    #[serde(default)]
+    pub modified: u64,
 }
 
 /// What was last synced to Google for an item, so the next sync can tell which
@@ -48,8 +56,35 @@ impl TodoItem {
             children: Vec::new(),
             folded: false,
             sync: None,
+            id: new_id(),
+            modified: now_ms(),
         }
     }
+}
+
+/// Current unix time in milliseconds — the resolution item merges compare at.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A random id for a newly created item or workspace.
+fn new_id() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish().max(1)
+}
+
+/// A deterministic id for pre-id (legacy) data, derived from where the item
+/// sits and what it says. Concurrent sessions loading the same legacy file
+/// must assign identical ids, or their first merge would duplicate everything.
+fn stable_id(ws_index: usize, path: &[usize], text: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (ws_index, path, text).hash(&mut hasher);
+    hasher.finish().max(1)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,6 +100,13 @@ pub struct Workspace {
     /// list. Toggled with `h`; persisted per workspace.
     #[serde(default)]
     pub hide_completed: bool,
+    /// Stable identity for cross-session merging; 0 = not yet assigned.
+    #[serde(default)]
+    pub id: u64,
+    /// Unix-millisecond time of the last edit to this workspace's own
+    /// metadata (name, hide flag, Google link) — not its items.
+    #[serde(default)]
+    pub modified: u64,
 }
 
 impl Workspace {
@@ -74,6 +116,8 @@ impl Workspace {
             items: Vec::new(),
             google_tasklist: None,
             hide_completed: false,
+            id: new_id(),
+            modified: now_ms(),
         }
     }
 }
@@ -125,7 +169,11 @@ impl Store {
 
         let payload = serde_json::to_string_pretty(self)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        fs::write(path, payload)
+        // Write-then-rename so a concurrent session never reads a half-written
+        // file (multiple sessions poll and merge this file).
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, payload)?;
+        fs::rename(&tmp, path)
     }
 
     pub fn normalize(&mut self) {
@@ -136,6 +184,65 @@ impl Store {
         if self.selected_workspace >= self.workspaces.len() {
             self.selected_workspace = self.workspaces.len().saturating_sub(1);
         }
+
+        // Give pre-id (legacy) data deterministic ids so every session that
+        // loads the same file assigns the same identities.
+        for (ws_index, ws) in self.workspaces.iter_mut().enumerate() {
+            if ws.id == 0 {
+                ws.id = stable_id(ws_index, &[], &ws.name);
+            }
+            let mut path = Vec::new();
+            assign_stable_item_ids(ws_index, &mut ws.items, &mut path);
+        }
+    }
+
+    /// Fold another session's copy of the data into this one. Items and
+    /// workspaces are matched by id; whichever copy was edited most recently
+    /// wins. Presence conflicts (one side has it, the other doesn't) are
+    /// decided against `last_synced_ms` — the last time this session read or
+    /// wrote the file: newer than that means "created/edited since, keep",
+    /// older means "the other side deleted it, drop". List order follows the
+    /// side whose layout changed most recently (creations, moves, and deletes
+    /// stamp every entry whose position shifted).
+    pub fn merge_from(&mut self, disk: Store, last_synced_ms: u64) {
+        let local = std::mem::take(&mut self.workspaces);
+        let local_newest = local.iter().map(|ws| ws.modified).max().unwrap_or(0);
+        let disk_newest = disk.workspaces.iter().map(|ws| ws.modified).max().unwrap_or(0);
+        let (primary, secondary) = if disk_newest > local_newest {
+            (disk.workspaces, local)
+        } else {
+            (local, disk.workspaces)
+        };
+
+        let secondary_order: Vec<u64> = secondary.iter().map(|ws| ws.id).collect();
+        let mut secondary_slots: Vec<Option<Workspace>> = secondary.into_iter().map(Some).collect();
+        let mut merged = Vec::new();
+        for ws in primary {
+            let matched = secondary_slots
+                .iter_mut()
+                .find(|slot| slot.as_ref().is_some_and(|other| other.id == ws.id))
+                .and_then(Option::take);
+            match matched {
+                Some(other) => merged.push(merge_workspace(ws, other, last_synced_ms)),
+                None if newest_workspace_change(&ws) >= last_synced_ms => merged.push(ws),
+                None => {}
+            }
+        }
+        for (index, slot) in secondary_slots.into_iter().enumerate() {
+            let Some(ws) = slot else { continue };
+            if newest_workspace_change(&ws) >= last_synced_ms {
+                let at = anchored_position(&secondary_order[..index], |id| {
+                    merged.iter().position(|m| m.id == id)
+                });
+                merged.insert(at, ws);
+            }
+        }
+
+        self.workspaces = merged;
+        // An item moved to different parents by both sessions shows up twice;
+        // keep the newest copy and splice the other's children into its place.
+        dedup_items_by_id(&mut self.workspaces);
+        self.normalize();
     }
 
     /// Resolve a workspace by name to its index. With no `workspace` the first
@@ -184,6 +291,139 @@ impl Store {
     }
 }
 
+fn assign_stable_item_ids(ws_index: usize, items: &mut [TodoItem], path: &mut Vec<usize>) {
+    for (index, item) in items.iter_mut().enumerate() {
+        path.push(index);
+        if item.id == 0 {
+            item.id = stable_id(ws_index, path, &item.title);
+        }
+        assign_stable_item_ids(ws_index, &mut item.children, path);
+        path.pop();
+    }
+}
+
+/// The most recent edit anywhere in the item's subtree. Presence decisions
+/// use this so editing a child protects its whole chain from a stale delete.
+fn newest_item_change(item: &TodoItem) -> u64 {
+    item.children
+        .iter()
+        .map(newest_item_change)
+        .fold(item.modified, u64::max)
+}
+
+fn newest_workspace_change(ws: &Workspace) -> u64 {
+    ws.items
+        .iter()
+        .map(newest_item_change)
+        .fold(ws.modified, u64::max)
+}
+
+/// Insertion point for an item from the secondary list: right after the
+/// nearest of its original predecessors (`priors`, in list order) that made
+/// it into the merged list, or the front when none did.
+fn anchored_position(priors: &[u64], position_of: impl Fn(u64) -> Option<usize>) -> usize {
+    priors
+        .iter()
+        .rev()
+        .find_map(|&id| position_of(id).map(|pos| pos + 1))
+        .unwrap_or(0)
+}
+
+/// Merge two copies of the same workspace (either side may be the local
+/// one — the merge is symmetric). Metadata follows the newer copy; the item
+/// trees merge item by item.
+fn merge_workspace(mut a: Workspace, mut b: Workspace, last_synced_ms: u64) -> Workspace {
+    let a_items = std::mem::take(&mut a.items);
+    let b_items = std::mem::take(&mut b.items);
+    let mut merged = if b.modified > a.modified { b } else { a };
+    merged.items = merge_items(a_items, b_items, last_synced_ms);
+    merged
+}
+
+fn merge_items(a: Vec<TodoItem>, b: Vec<TodoItem>, last_synced_ms: u64) -> Vec<TodoItem> {
+    // The side with the most recently stamped member dictates the order:
+    // creating, moving, or deleting an entry stamps everything whose
+    // position shifted, so the newer layout is what a user actually saw.
+    let a_newest = a.iter().map(|item| item.modified).max().unwrap_or(0);
+    let b_newest = b.iter().map(|item| item.modified).max().unwrap_or(0);
+    let (primary, secondary) = if b_newest > a_newest { (b, a) } else { (a, b) };
+
+    let secondary_order: Vec<u64> = secondary.iter().map(|item| item.id).collect();
+    let mut secondary_slots: Vec<Option<TodoItem>> = secondary.into_iter().map(Some).collect();
+    let mut merged = Vec::new();
+
+    for mut item in primary {
+        let matched = secondary_slots
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|other| other.id == item.id))
+            .and_then(Option::take);
+        match matched {
+            Some(mut other) => {
+                let item_children = std::mem::take(&mut item.children);
+                let other_children = std::mem::take(&mut other.children);
+                let mut keep = if other.modified > item.modified { other } else { item };
+                keep.children = merge_items(item_children, other_children, last_synced_ms);
+                merged.push(keep);
+            }
+            None if newest_item_change(&item) >= last_synced_ms => merged.push(item),
+            None => {}
+        }
+    }
+    // Survivors that exist only on the secondary side keep their place
+    // relative to their own neighbors instead of being dumped at the end.
+    for (index, slot) in secondary_slots.into_iter().enumerate() {
+        let Some(item) = slot else { continue };
+        if newest_item_change(&item) >= last_synced_ms {
+            let at = anchored_position(&secondary_order[..index], |id| {
+                merged.iter().position(|m| m.id == id)
+            });
+            merged.insert(at, item);
+        }
+    }
+    merged
+}
+
+/// Drop all but the newest copy of any id that appears more than once,
+/// splicing a dropped copy's children into its place so nothing is lost.
+fn dedup_items_by_id(workspaces: &mut [Workspace]) {
+    use std::collections::{HashMap, HashSet};
+
+    fn collect_newest(items: &[TodoItem], newest: &mut HashMap<u64, u64>) {
+        for item in items {
+            let entry = newest.entry(item.id).or_insert(0);
+            *entry = (*entry).max(item.modified);
+            collect_newest(&item.children, newest);
+        }
+    }
+
+    fn prune(items: &mut Vec<TodoItem>, newest: &HashMap<u64, u64>, kept: &mut HashSet<u64>) {
+        let mut index = 0;
+        while index < items.len() {
+            let item = &items[index];
+            let is_newest = item.modified >= newest.get(&item.id).copied().unwrap_or(0);
+            if is_newest && kept.insert(item.id) {
+                prune(&mut items[index].children, newest, kept);
+                index += 1;
+            } else {
+                let removed = items.remove(index);
+                for (offset, child) in removed.children.into_iter().enumerate() {
+                    items.insert(index + offset, child);
+                }
+                // Re-examine from the same index: the spliced children land here.
+            }
+        }
+    }
+
+    let mut newest = HashMap::new();
+    for ws in workspaces.iter() {
+        collect_newest(&ws.items, &mut newest);
+    }
+    let mut kept = HashSet::new();
+    for ws in workspaces.iter_mut() {
+        prune(&mut ws.items, &newest, &mut kept);
+    }
+}
+
 pub fn default_data_path() -> PathBuf {
     if let Ok(path) = env::var("JOT_CLI_DATA_PATH") {
         return PathBuf::from(path);
@@ -215,6 +455,46 @@ pub fn config_dir() -> PathBuf {
         return PathBuf::from(home).join(".config").join("jot-cli");
     }
     PathBuf::from(".")
+}
+
+pub fn default_config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+/// Optional user configuration. Lives at [`default_config_path`] unless
+/// `--config` points elsewhere; a missing file just means defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Config {
+    /// Where the notes file lives (e.g. a folder synced by iCloud/Dropbox).
+    /// `~/` expands to the home directory; a relative path resolves against
+    /// the config file's own directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_path: Option<PathBuf>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> io::Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("bad config {}: {error}", path.display()),
+                )
+            }),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Expand a leading `~/` to the home directory.
+fn expand_tilde(path: &Path) -> PathBuf {
+    if let Ok(home) = env::var("HOME")
+        && let Ok(rest) = path.strip_prefix("~")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    path.to_path_buf()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,6 +702,15 @@ struct Snapshot {
     selected_path: Option<Vec<usize>>,
 }
 
+/// A transient status-line message that restores the previous text when it
+/// expires (unless something else has replaced the status meanwhile).
+#[derive(Debug, Clone)]
+struct Flash {
+    shown: String,
+    restore: String,
+    until: std::time::Instant,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub store: Store,
@@ -429,6 +718,7 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub status: String,
+    flash: Option<Flash>,
     /// Bounded history of pre-edit snapshots, newest last. Capped at
     /// [`UNDO_DEPTH`]; in memory only.
     undo_stack: Vec<Snapshot>,
@@ -447,6 +737,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Tasks,
             status: String::from(CONTROLS),
+            flash: None,
             undo_stack: Vec::new(),
             edit_wrap_width: 40,
         };
@@ -503,9 +794,57 @@ impl App {
         self.status = status.into();
     }
 
+    /// Show `text` in the status line for `duration`, then restore whatever
+    /// was there — unless something else overwrote the status meanwhile.
+    pub fn flash_status(&mut self, text: impl Into<String>, duration: std::time::Duration) {
+        let shown = text.into();
+        // Chained flashes restore the original pre-flash status, not a flash.
+        let restore = match self.flash.take() {
+            Some(flash) if flash.shown == self.status => flash.restore,
+            _ => self.status.clone(),
+        };
+        self.flash = Some(Flash {
+            shown: shown.clone(),
+            restore,
+            until: std::time::Instant::now() + duration,
+        });
+        self.status = shown;
+    }
+
+    /// Expire a finished flash. Called regularly by the event loop's tick.
+    pub fn expire_flash(&mut self) {
+        if let Some(flash) = &self.flash
+            && std::time::Instant::now() >= flash.until
+        {
+            if self.status == flash.shown {
+                self.status = flash.restore.clone();
+            }
+            self.flash = None;
+        }
+    }
+
     /// Report the editing dialog's inner width so Up/Down move by visual row.
     pub fn set_edit_wrap_width(&mut self, width: usize) {
         self.edit_wrap_width = width.max(1);
+    }
+
+    /// Select a workspace directly (mouse click) and focus its pane.
+    pub fn select_workspace(&mut self, index: usize) {
+        if index >= self.store.workspaces.len() {
+            return;
+        }
+        self.store.selected_workspace = index;
+        self.ensure_selection();
+        self.set_focus(Focus::Workspaces);
+    }
+
+    /// Select the visible item at `path` directly (mouse click) and focus the
+    /// tasks pane. Ignores paths that aren't currently shown.
+    pub fn select_task(&mut self, path: Vec<usize>) {
+        if self.flattened_items().iter().any(|item| item.path == path) {
+            self.selected_path = Some(path);
+            self.set_focus(Focus::Tasks);
+        }
     }
 
     /// Re-validate selection after a sync may have added or removed items.
@@ -538,9 +877,77 @@ impl App {
             }
         };
         if matches!(update, Update::Save) {
+            self.stamp_changes(&before.store);
             self.record_undo(before);
         }
         update
+    }
+
+    /// Set `modified = now` on every item and workspace whose own fields or
+    /// position changed relative to `before`. Centralized here so each edit
+    /// path doesn't have to remember to stamp what it touched.
+    fn stamp_changes(&mut self, before: &Store) {
+        use std::collections::HashMap;
+
+        type ItemPrint = (u64, Option<u64>, usize, String, bool, bool);
+        fn collect(
+            ws_id: u64,
+            parent: Option<u64>,
+            items: &[TodoItem],
+            out: &mut HashMap<u64, ItemPrint>,
+        ) {
+            for (index, item) in items.iter().enumerate() {
+                out.insert(
+                    item.id,
+                    (ws_id, parent, index, item.title.clone(), item.done, item.folded),
+                );
+                collect(ws_id, Some(item.id), &item.children, out);
+            }
+        }
+
+        fn stamp(
+            ws_id: u64,
+            parent: Option<u64>,
+            items: &mut [TodoItem],
+            old: &HashMap<u64, ItemPrint>,
+            now: u64,
+        ) {
+            for (index, item) in items.iter_mut().enumerate() {
+                let print = (ws_id, parent, index, item.title.clone(), item.done, item.folded);
+                if old.get(&item.id) != Some(&print) {
+                    item.modified = now;
+                }
+                let id = item.id;
+                stamp(ws_id, Some(id), &mut item.children, old, now);
+            }
+        }
+
+        let now = now_ms();
+        let mut old_items = HashMap::new();
+        let mut old_meta = HashMap::new();
+        for (index, ws) in before.workspaces.iter().enumerate() {
+            old_meta.insert(ws.id, (index, ws.name.clone(), ws.hide_completed));
+            collect(ws.id, None, &ws.items, &mut old_items);
+        }
+        for (index, ws) in self.store.workspaces.iter_mut().enumerate() {
+            let meta = (index, ws.name.clone(), ws.hide_completed);
+            if old_meta.get(&ws.id) != Some(&meta) {
+                ws.modified = now;
+            }
+            stamp(ws.id, None, &mut ws.items, &old_items, now);
+        }
+    }
+
+    /// Fold in a copy of the data file written by another session. Returns
+    /// whether anything visible changed. See [`Store::merge_from`].
+    pub fn merge_from_disk(&mut self, disk: Store, last_synced_ms: u64) -> bool {
+        let before = self.store.clone();
+        self.store.merge_from(disk, last_synced_ms);
+        let changed = self.store != before;
+        if changed {
+            self.ensure_selection();
+        }
+        changed
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -563,8 +970,13 @@ impl App {
     pub fn undo(&mut self) -> bool {
         match self.undo_stack.pop() {
             Some(snapshot) => {
+                let before_undo = self.store.clone();
                 self.store = snapshot.store;
                 self.selected_path = snapshot.selected_path;
+                // Stamp what the undo changed: without this the restored
+                // (older) state would lose the cross-session merge against
+                // the very edit it just undid.
+                self.stamp_changes(&before_undo);
                 self.store.normalize();
                 self.ensure_selection();
                 self.status = format!("Undo • {} more available", self.undo_stack.len());
@@ -1807,7 +2219,11 @@ fn insert_relative(
 /// field; otherwise it launches the full TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliArgs {
-    pub data_path: PathBuf,
+    /// `--data-path` as given; the final location comes from
+    /// [`CliArgs::resolve_data_path`].
+    pub data_path: Option<PathBuf>,
+    /// `--config` as given; defaults to [`default_config_path`].
+    pub config_path: Option<PathBuf>,
     /// Title of a task to add directly from the command line (`-a`/`--add`).
     pub add: Option<String>,
     /// Target workspace by name (`-w`/`--workspace`); defaults to the top one.
@@ -1820,10 +2236,45 @@ pub struct CliArgs {
     pub sync: bool,
 }
 
+impl CliArgs {
+    /// The notes file to use: `--data-path` beats the `JOT_CLI_DATA_PATH`
+    /// environment variable, which beats the config file's `data_path`,
+    /// which beats the default location. Errors only on an unreadable or
+    /// malformed config file.
+    pub fn resolve_data_path(&self) -> io::Result<PathBuf> {
+        if let Some(path) = &self.data_path {
+            return Ok(expand_tilde(path));
+        }
+        if let Ok(path) = env::var("JOT_CLI_DATA_PATH") {
+            return Ok(expand_tilde(Path::new(&path)));
+        }
+
+        let config_path = self
+            .config_path
+            .as_ref()
+            .map(|path| expand_tilde(path))
+            .unwrap_or_else(default_config_path);
+        if let Some(data_path) = Config::load(&config_path)?.data_path {
+            let data_path = expand_tilde(&data_path);
+            return Ok(if data_path.is_relative() {
+                config_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(data_path)
+            } else {
+                data_path
+            });
+        }
+
+        Ok(default_data_path())
+    }
+}
+
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
     let mut args = args.into_iter().peekable();
     let _ = args.next();
     let mut data_path = None;
+    let mut config_path = None;
     let mut add = None;
     let mut workspace = None;
     let mut prompt_add = false;
@@ -1838,6 +2289,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
                     .next()
                     .ok_or_else(|| String::from("expected a path after --data-path"))?;
                 data_path = Some(PathBuf::from(value));
+            }
+            "--config" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| String::from("expected a path after --config"))?;
+                config_path = Some(PathBuf::from(value));
             }
             "-a" | "--add" => {
                 let value = args
@@ -1859,7 +2316,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
             "--silent" => silent = true,
             "--help" | "-h" => {
                 return Err(String::from(
-                    "Usage: jot-cli [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item, or the workspace on the workspaces pane\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child), or reorder workspace on the workspaces pane\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
+                    "Usage: jot-cli [--config <path>] [--data-path <path>] [-a|--add <task>] [-w|--workspace [name]] [--sync] [--silent]\n\nFiles:\n  --config <path>           use this config file instead of\n                            ~/.config/jot-cli/config.json\n  --data-path <path>        use this notes file, overriding the config\n                            (order: --data-path > JOT_CLI_DATA_PATH >\n                            config data_path > default state.json)\n  The config file is JSON; set where the notes live with e.g.\n    { \"data_path\": \"~/Library/Mobile Documents/com~apple~CloudDocs/jot/state.json\" }\n\nAdd a task without the full TUI:\n  -a, --add <task>          add a task and exit (defaults to the top workspace)\n  -w, --workspace [name]    open an inline input field to add a task, then exit\n                            (defaults to the top workspace; name is optional)\n  --sync                    sync Google-linked workspaces and exit\n                            (requires a build with --features google)\n  --silent                  print nothing on success (errors still shown)\n\nControls:\n  ←/→         focus workspaces / tasks pane\n  Tab         toggle focused pane\n  mouse click select an item or workspace\n  ↑/↓ or k/j  move within focused pane\n  a add item\n  o add child item\n  e rename item, or the workspace on the workspaces pane\n  x toggle done\n  z fold/unfold nested items\n  Z unfold all items\n  h hide/show completed items\n  H delete hidden (completed) items\n  m move item (→ nest as child), or reorder workspace on the workspaces pane\n  d delete item\n  w new workspace\n  ? show controls\n  q quit",
                 ));
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -1867,7 +2324,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
     }
 
     Ok(CliArgs {
-        data_path: data_path.unwrap_or_else(default_data_path),
+        data_path,
+        config_path,
         add,
         workspace,
         prompt_add,
@@ -1903,9 +2361,13 @@ mod tests {
                     children: vec![TodoItem::new("Child")],
                     folded: false,
                     sync: None,
+                    id: 7,
+                    modified: 1,
                 }],
                 google_tasklist: None,
                 hide_completed: false,
+                id: 3,
+                modified: 1,
             }],
             selected_workspace: 0,
             auto_sync: false,
@@ -1915,6 +2377,301 @@ mod tests {
         let loaded = Store::load(&path).expect("load store");
 
         assert_eq!(loaded, store);
+    }
+
+    /// A bare item with explicit identity, for merge tests.
+    fn item(id: u64, modified: u64, title: &str) -> TodoItem {
+        TodoItem {
+            title: String::from(title),
+            done: false,
+            children: Vec::new(),
+            folded: false,
+            sync: None,
+            id,
+            modified,
+        }
+    }
+
+    fn one_ws_store(items: Vec<TodoItem>) -> Store {
+        let mut ws = Workspace::new("W");
+        ws.id = 99;
+        ws.modified = 1;
+        ws.items = items;
+        Store {
+            workspaces: vec![ws],
+            selected_workspace: 0,
+            auto_sync: false,
+        }
+    }
+
+    fn titles(store: &Store) -> Vec<&str> {
+        store.workspaces[0]
+            .items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn merge_newer_copy_of_an_item_wins() {
+        let mut local = one_ws_store(vec![item(1, 100, "old title")]);
+        let disk = one_ws_store(vec![item(1, 200, "new title")]);
+        local.merge_from(disk, 50);
+        assert_eq!(titles(&local), ["new title"]);
+
+        let mut local = one_ws_store(vec![item(1, 300, "mine is newer")]);
+        let disk = one_ws_store(vec![item(1, 200, "stale")]);
+        local.merge_from(disk, 50);
+        assert_eq!(titles(&local), ["mine is newer"]);
+    }
+
+    #[test]
+    fn merge_keeps_additions_from_both_sides() {
+        // Synced at t=1000; each side added something afterwards.
+        let mut local = one_ws_store(vec![item(1, 500, "shared"), item(2, 1500, "local new")]);
+        let disk = one_ws_store(vec![item(1, 500, "shared"), item(3, 1600, "disk new")]);
+        local.merge_from(disk, 1000);
+        assert_eq!(titles(&local), ["shared", "local new", "disk new"]);
+    }
+
+    #[test]
+    fn merge_keeps_an_item_created_in_the_middle_in_the_middle() {
+        // The other session inserted "m" between x and y (stamping m, y, z
+        // whose positions shifted). It must not land at the bottom here.
+        let mut local = one_ws_store(vec![
+            item(1, 100, "x"),
+            item(2, 100, "y"),
+            item(3, 100, "z"),
+        ]);
+        let disk = one_ws_store(vec![
+            item(1, 100, "x"),
+            item(9, 2000, "m"),
+            item(2, 2000, "y"),
+            item(3, 2000, "z"),
+        ]);
+        local.merge_from(disk, 1000);
+        assert_eq!(titles(&local), ["x", "m", "y", "z"]);
+    }
+
+    #[test]
+    fn merge_adopts_a_reorder_from_the_newer_side() {
+        let mut local = one_ws_store(vec![
+            item(1, 100, "a"),
+            item(2, 100, "b"),
+            item(3, 100, "c"),
+        ]);
+        let disk = one_ws_store(vec![
+            item(3, 2000, "c"),
+            item(1, 2000, "a"),
+            item(2, 2000, "b"),
+        ]);
+        local.merge_from(disk, 50);
+        assert_eq!(titles(&local), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn merge_anchors_additions_from_both_sides() {
+        // Both sessions inserted mid-list since the last sync (t=1000);
+        // each new item stays next to the neighbor it was created under.
+        let mut local = one_ws_store(vec![
+            item(1, 100, "x"),
+            item(2, 100, "y"),
+            item(8, 2000, "q"), // local: q inserted after y
+            item(3, 100, "z"),
+        ]);
+        let disk = one_ws_store(vec![
+            item(1, 100, "x"),
+            item(9, 1500, "p"), // other session: p inserted after x
+            item(2, 100, "y"),
+            item(3, 100, "z"),
+        ]);
+        local.merge_from(disk, 1000);
+        assert_eq!(titles(&local), ["x", "p", "y", "q", "z"]);
+    }
+
+    #[test]
+    fn merge_adopts_workspace_reorder_from_the_newer_side() {
+        let mut ws_a = Workspace::new("A");
+        ws_a.id = 1;
+        ws_a.modified = 100;
+        let mut ws_b = Workspace::new("B");
+        ws_b.id = 2;
+        ws_b.modified = 100;
+
+        let mut local = Store {
+            workspaces: vec![ws_a.clone(), ws_b.clone()],
+            selected_workspace: 0,
+            auto_sync: false,
+        };
+        // The other session moved B above A (stamping both positions).
+        ws_a.modified = 2000;
+        ws_b.modified = 2000;
+        let disk = Store {
+            workspaces: vec![ws_b, ws_a],
+            selected_workspace: 0,
+            auto_sync: false,
+        };
+
+        local.merge_from(disk, 50);
+        let names: Vec<&str> = local.workspaces.iter().map(|ws| ws.name.as_str()).collect();
+        assert_eq!(names, ["B", "A"]);
+    }
+
+    #[test]
+    fn merge_applies_deletions_from_the_other_session() {
+        // Disk lacks item 2, which we haven't touched since the last sync —
+        // the other session deleted it.
+        let mut local = one_ws_store(vec![item(1, 500, "kept"), item(2, 500, "deleted there")]);
+        let disk = one_ws_store(vec![item(1, 500, "kept")]);
+        local.merge_from(disk, 1000);
+        assert_eq!(titles(&local), ["kept"]);
+    }
+
+    #[test]
+    fn merge_edit_beats_delete() {
+        // Disk lacks item 2, but we edited it after the last sync: keep it.
+        let mut local = one_ws_store(vec![item(1, 500, "kept"), item(2, 1500, "edited here")]);
+        let disk = one_ws_store(vec![item(1, 500, "kept")]);
+        local.merge_from(disk, 1000);
+        assert_eq!(titles(&local), ["kept", "edited here"]);
+    }
+
+    #[test]
+    fn merge_editing_a_child_protects_its_parent_chain() {
+        // The other session deleted parent 2; we edited its child since.
+        let mut parent = item(2, 500, "parent");
+        parent.children.push(item(3, 1500, "edited child"));
+        let mut local = one_ws_store(vec![item(1, 500, "kept"), parent]);
+        let disk = one_ws_store(vec![item(1, 500, "kept")]);
+        local.merge_from(disk, 1000);
+        assert_eq!(titles(&local), ["kept", "parent"]);
+        assert_eq!(local.workspaces[0].items[1].children.len(), 1);
+    }
+
+    #[test]
+    fn merge_workspace_metadata_follows_newer_copy() {
+        let mut local = one_ws_store(vec![]);
+        let mut disk = one_ws_store(vec![]);
+        disk.workspaces[0].name = String::from("Renamed");
+        disk.workspaces[0].modified = 900;
+        local.merge_from(disk, 50);
+        assert_eq!(local.workspaces[0].name, "Renamed");
+    }
+
+    #[test]
+    fn edits_stamp_item_timestamps() {
+        let mut app = App::new(Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Enter);
+
+        app.store.workspaces[0].items[0].modified = 5;
+        app.store.workspaces[0].items[1].modified = 5;
+
+        // Toggling the selected (second) item stamps it and only it.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.store.workspaces[0].items[0].modified, 5);
+        assert!(app.store.workspaces[0].items[1].modified > 5);
+    }
+
+    #[test]
+    fn undo_stamps_the_restored_state() {
+        let mut app = App::new(Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+
+        app.store.workspaces[0].items[0].modified = 5;
+        press(&mut app, KeyCode::Char(' ')); // toggle done (stamps to now)
+        assert!(app.undo());
+
+        let item = &app.store.workspaces[0].items[0];
+        assert!(!item.done);
+        // Without stamping, the restored copy would carry modified = 5 and
+        // lose the merge against the very state it undid.
+        assert!(item.modified > 5);
+    }
+
+    #[test]
+    fn legacy_files_get_identical_ids_in_every_session() {
+        let path = temp_path("legacy-ids");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"workspaces":[{"name":"W","items":[
+                {"title":"a","done":false,"children":[{"title":"b","done":false}]},
+                {"title":"c","done":false}
+            ]}]}"#,
+        )
+        .unwrap();
+
+        let first = Store::load(&path).expect("load once");
+        let second = Store::load(&path).expect("load twice");
+
+        assert_eq!(first.workspaces[0].id, second.workspaces[0].id);
+        let ids = |store: &Store| -> Vec<u64> {
+            let items = &store.workspaces[0].items;
+            vec![items[0].id, items[0].children[0].id, items[1].id]
+        };
+        assert_eq!(ids(&first), ids(&second));
+        assert!(ids(&first).iter().all(|&id| id != 0));
+    }
+
+    #[test]
+    fn flash_status_restores_after_expiry() {
+        let mut app = App::new(Store::default());
+        app.set_status("base");
+        app.flash_status("⟳ synced", std::time::Duration::ZERO);
+        assert_eq!(app.status, "⟳ synced");
+        app.expire_flash();
+        assert_eq!(app.status, "base");
+    }
+
+    #[test]
+    fn flash_never_clobbers_a_newer_status() {
+        let mut app = App::new(Store::default());
+        app.set_status("base");
+        app.flash_status("⟳ synced", std::time::Duration::ZERO);
+        app.set_status("something newer");
+        app.expire_flash();
+        assert_eq!(app.status, "something newer");
+    }
+
+    #[test]
+    fn config_data_path_points_elsewhere() {
+        let config_path = temp_path("config");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, r#"{"data_path":"notes/here.json"}"#).unwrap();
+
+        let args = CliArgs {
+            data_path: None,
+            config_path: Some(config_path.clone()),
+            add: None,
+            workspace: None,
+            prompt_add: false,
+            silent: false,
+            sync: false,
+        };
+        // JOT_CLI_DATA_PATH may leak in from the environment; only assert the
+        // config is honored when the env override isn't set.
+        if env::var("JOT_CLI_DATA_PATH").is_err() {
+            let resolved = args.resolve_data_path().expect("resolve");
+            // Relative config paths resolve against the config file's folder.
+            assert_eq!(resolved, config_path.parent().unwrap().join("notes/here.json"));
+        }
+
+        // An explicit --data-path always wins.
+        let with_flag = CliArgs {
+            data_path: Some(PathBuf::from("/explicit/state.json")),
+            ..args
+        };
+        assert_eq!(
+            with_flag.resolve_data_path().expect("resolve"),
+            PathBuf::from("/explicit/state.json")
+        );
     }
 
     #[test]

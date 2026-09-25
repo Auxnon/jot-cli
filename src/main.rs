@@ -5,8 +5,9 @@ use std::{
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     cursor::MoveToColumn,
@@ -36,7 +37,16 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let mut store = jot_cli::Store::load(&args.data_path)?;
+    // Where the notes live: --data-path > JOT_CLI_DATA_PATH > config > default.
+    let data_path = match args.resolve_data_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut store = jot_cli::Store::load(&data_path)?;
 
     // With Google enabled, make sure the default-list workspace exists.
     #[cfg(feature = "google")]
@@ -48,7 +58,7 @@ fn main() -> io::Result<()> {
         {
             match jot_cli::sync::sync_store(&mut store) {
                 Ok(summary) => {
-                    store.save(&args.data_path)?;
+                    store.save(&data_path)?;
                     if !args.silent {
                         println!("{}", summary.describe());
                     }
@@ -74,7 +84,7 @@ fn main() -> io::Result<()> {
     if let Some(title) = &args.add {
         match store.add_item(title, args.workspace.as_deref()) {
             Ok(workspace) => {
-                store.save(&args.data_path)?;
+                store.save(&data_path)?;
                 if !args.silent {
                     println!("Added \"{title}\" to {workspace}");
                 }
@@ -90,7 +100,7 @@ fn main() -> io::Result<()> {
     // `-w`/`--workspace` without `--add`: pop up an inline input field, add the
     // typed task to the (possibly named) workspace, then exit.
     if args.prompt_add {
-        return prompt_add(&mut store, &args);
+        return prompt_add(&mut store, &args, &data_path);
     }
 
     // Auto-sync on launch when the user has enabled it.
@@ -98,7 +108,7 @@ fn main() -> io::Result<()> {
     if store.auto_sync {
         match jot_cli::sync::sync_store(&mut store) {
             Ok(_) => {
-                let _ = store.save(&args.data_path);
+                let _ = store.save(&data_path);
             }
             Err(message) => eprintln!("Auto-sync on launch failed: {message}"),
         }
@@ -107,7 +117,7 @@ fn main() -> io::Result<()> {
     let mut app = App::new(store);
 
     let terminal = ratatui::init();
-    let result = run(terminal, &mut app, &args.data_path);
+    let result = run(terminal, &mut app, &data_path);
     ratatui::restore();
 
     // Auto-sync on quit when enabled (after the terminal is restored, so any
@@ -116,7 +126,7 @@ fn main() -> io::Result<()> {
     if app.store.auto_sync {
         match jot_cli::sync::sync_store(&mut app.store) {
             Ok(_) => {
-                let _ = app.store.save(&args.data_path);
+                let _ = app.store.save(&data_path);
             }
             Err(message) => eprintln!("Auto-sync on quit failed: {message}"),
         }
@@ -127,7 +137,11 @@ fn main() -> io::Result<()> {
 
 /// Validate the target workspace, show a single inline input field, and add
 /// whatever the user types. Enter confirms (empty input cancels), Esc cancels.
-fn prompt_add(store: &mut jot_cli::Store, args: &CliArgs) -> io::Result<()> {
+fn prompt_add(
+    store: &mut jot_cli::Store,
+    args: &CliArgs,
+    data_path: &std::path::Path,
+) -> io::Result<()> {
     // Resolve the workspace up front so a bad name fails before we prompt.
     let workspace = match store.workspace_name(args.workspace.as_deref()) {
         Ok(name) => name,
@@ -144,7 +158,7 @@ fn prompt_add(store: &mut jot_cli::Store, args: &CliArgs) -> io::Result<()> {
     let name = store
         .add_item(&title, args.workspace.as_deref())
         .expect("workspace was validated above");
-    store.save(&args.data_path)?;
+    store.save(data_path)?;
     if !args.silent {
         println!("Added \"{title}\" to {name}");
     }
@@ -281,13 +295,25 @@ fn read_inline_input(workspace: &str) -> io::Result<Option<String>> {
     Ok(outcome.filter(|title| !title.is_empty()))
 }
 
+/// Where the panes landed in the last frame, plus each list's scroll state.
+/// Kept across frames so a mouse click can be mapped back to the item that
+/// was drawn under the pointer (items span a variable number of lines).
+#[derive(Default)]
+struct PaneUi {
+    ws_area: Rect,
+    task_area: Rect,
+    ws_state: ListState,
+    task_state: ListState,
+}
+
 fn run(
     mut terminal: DefaultTerminal,
     app: &mut App,
     data_path: &std::path::Path,
 ) -> io::Result<()> {
     // Bracketed paste lets the terminal hand us paste payloads as Event::Paste.
-    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    // Mouse capture reports clicks so the panes can be clicked to select.
+    let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     // The Kitty keyboard protocol lets supporting terminals report the macOS
     // Command key (as SUPER), so Cmd+C can reach us instead of being swallowed.
     let enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
@@ -304,7 +330,7 @@ fn run(
     if enhanced {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     result
 }
 
@@ -316,13 +342,17 @@ fn event_loop(
 ) -> io::Result<()> {
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
+    let mut ui = PaneUi::default();
+    let mut file_sync = FileSync::new(data_path);
 
     loop {
+        app.expire_flash();
+
         // Tell the app how wide the editing dialog currently is, so Up/Down
         // in a dialog move the cursor by exactly one wrapped row.
         app.set_edit_wrap_width(modal_inner_width(terminal.size()?.width));
 
-        terminal.draw(|frame| draw(frame, app))?;
+        terminal.draw(|frame| draw(frame, app, &mut ui))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -356,21 +386,21 @@ fn event_loop(
                         app.paste(content);
                     } else if undo {
                         if app.undo() {
-                            app.store.save(data_path)?;
+                            file_sync.save(app, data_path)?;
                         }
                     } else {
                         match app.handle_key(key) {
                             Update::Quit => {
-                                app.store.save(data_path)?;
+                                file_sync.save(app, data_path)?;
                                 return Ok(());
                             }
-                            Update::Save => app.store.save(data_path)?,
+                            Update::Save => file_sync.save(app, data_path)?,
                             Update::None => {}
                             #[cfg(feature = "google")]
                             Update::Sync => {
                                 // Blocking network round-trip; the status line
                                 // already shows "Syncing…" from this frame.
-                                terminal.draw(|frame| draw(frame, app))?;
+                                terminal.draw(|frame| draw(frame, app, &mut ui))?;
                                 match jot_cli::sync::sync_store(&mut app.store) {
                                     Ok(summary) => app.set_status(summary.describe()),
                                     Err(message) => {
@@ -378,12 +408,17 @@ fn event_loop(
                                     }
                                 }
                                 app.refresh_after_sync();
-                                app.store.save(data_path)?;
+                                file_sync.save(app, data_path)?;
                             }
                         }
                     }
                 }
                 Event::Paste(content) => app.paste(content),
+                Event::Mouse(mouse) => {
+                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                        handle_click(app, &ui, mouse.column, mouse.row);
+                    }
+                }
                 _ => {}
             }
         }
@@ -391,7 +426,88 @@ fn event_loop(
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
         }
+
+        // Once a minute, pick up whatever other jot sessions wrote to the
+        // data file and briefly say so in the status line.
+        if file_sync.last_check.elapsed() >= FILE_SYNC_INTERVAL
+            && file_sync.check(app, data_path)?
+        {
+            app.flash_status("⟳ synced", SYNC_FLASH);
+        }
     }
+}
+
+/// How often the data file is polled for other sessions' writes.
+const FILE_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+/// How long the "⟳ synced" note stays in the status line.
+const SYNC_FLASH: Duration = Duration::from_millis(2500);
+
+/// Keeps this session reconciled with the shared data file so several jot
+/// instances can run at once. Every save first folds in anything another
+/// session wrote; a periodic check does the same between edits.
+struct FileSync {
+    /// The file's mtime after our last read or write; a different value
+    /// means another session has written since.
+    mtime: Option<std::time::SystemTime>,
+    /// When we last read or wrote the file (unix ms). Presence conflicts in
+    /// the merge are decided against this instant.
+    last_synced_ms: u64,
+    last_check: Instant,
+}
+
+impl FileSync {
+    fn new(data_path: &std::path::Path) -> Self {
+        Self {
+            mtime: mtime_of(data_path),
+            last_synced_ms: jot_cli::now_ms(),
+            last_check: Instant::now(),
+        }
+    }
+
+    /// Merge any foreign changes into the app, then write the app's state.
+    fn save(&mut self, app: &mut App, data_path: &std::path::Path) -> io::Result<()> {
+        self.reconcile(app, data_path, true)?;
+        Ok(())
+    }
+
+    /// Periodic check: read + merge + write back only when needed. Returns
+    /// whether anything from another session was folded in.
+    fn check(&mut self, app: &mut App, data_path: &std::path::Path) -> io::Result<bool> {
+        self.last_check = Instant::now();
+        self.reconcile(app, data_path, false)
+    }
+
+    fn reconcile(
+        &mut self,
+        app: &mut App,
+        data_path: &std::path::Path,
+        write: bool,
+    ) -> io::Result<bool> {
+        let mut merged = false;
+        let mut needs_write = write;
+
+        if mtime_of(data_path) != self.mtime {
+            // A half-written file from another session (or any parse error)
+            // just skips this round; the next check will pick it up.
+            if let Ok(disk) = jot_cli::Store::load(data_path) {
+                let disk_workspaces = disk.workspaces.clone();
+                merged = app.merge_from_disk(disk, self.last_synced_ms);
+                // Write back if the merge kept anything the file lacks.
+                needs_write = needs_write || app.store.workspaces != disk_workspaces;
+            }
+        }
+
+        if needs_write {
+            app.store.save(data_path)?;
+        }
+        self.mtime = mtime_of(data_path);
+        self.last_synced_ms = jot_cli::now_ms();
+        Ok(merged)
+    }
+}
+
+fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 /// The text shown in the status bar for the current mode.
@@ -402,7 +518,7 @@ fn status_text(app: &App) -> String {
     }
 }
 
-fn draw(frame: &mut Frame, app: &App) {
+fn draw(frame: &mut Frame, app: &App, ui: &mut PaneUi) {
     let status = status_text(app);
 
     // Size the status bar to the text it's actually showing: the long controls
@@ -604,30 +720,31 @@ fn draw(frame: &mut Frame, app: &App) {
     };
     // Stateful rendering scrolls each pane so the selected (multi-line) item
     // stays fully visible now that wrapped items can outgrow the viewport.
+    // The state and pane rects persist in `ui` for mouse-click hit testing.
     let selected_ws_row = match reorder {
         Some((_, target)) => Some(target),
         None => display_order
             .iter()
             .position(|&index| index == app.store.selected_workspace),
     };
-    let mut ws_state = ListState::default();
-    ws_state.select(selected_ws_row);
+    ui.ws_area = columns[0];
+    ui.ws_state.select(selected_ws_row);
     frame.render_stateful_widget(
         List::new(workspace_items).block(focus_block("Workspaces", workspaces_focused)),
         columns[0],
-        &mut ws_state,
+        &mut ui.ws_state,
     );
 
     let selected_task_row = app
         .selected_path
         .as_ref()
         .and_then(|path| flat.iter().position(|item| &item.path == path));
-    let mut task_state = ListState::default();
-    task_state.select(selected_task_row);
+    ui.task_area = columns[1];
+    ui.task_state.select(selected_task_row);
     frame.render_stateful_widget(
         List::new(items).block(focus_block(workspace_title, tasks_focused)),
         columns[1],
-        &mut task_state,
+        &mut ui.task_state,
     );
 
     frame.render_widget(
@@ -703,6 +820,53 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Map a left click to the item that was rendered under the pointer and
+/// select it. Only acts in Normal mode — dialogs and confirmations keep their
+/// keyboard-driven flow. Returns whether the click selected something.
+fn handle_click(app: &mut App, ui: &PaneUi, column: u16, row: u16) -> bool {
+    if !matches!(app.mode, Mode::Normal) {
+        return false;
+    }
+
+    if let Some(clicked_row) = inner_row(ui.ws_area, column, row) {
+        // Walk the workspaces from the pane's scroll offset, adding up each
+        // label's wrapped height, until we pass the clicked row.
+        let inner_width = ui.ws_area.width.saturating_sub(2) as usize;
+        let mut y = 0;
+        for index in ui.ws_state.offset()..app.store.workspaces.len() {
+            let workspace = &app.store.workspaces[index];
+            let label = format!("{} ({})", workspace.name, workspace.items.len());
+            y += wrap_words(&label, inner_width).len();
+            if clicked_row < y {
+                app.select_workspace(index);
+                return true;
+            }
+        }
+    } else if let Some(clicked_row) = inner_row(ui.task_area, column, row) {
+        // Same walk over the flattened items, with each title wrapped at the
+        // width left after its indent/glyph/symbol head.
+        let inner_width = ui.task_area.width.saturating_sub(2) as usize;
+        let mut y = 0;
+        for item in app.flattened_items().into_iter().skip(ui.task_state.offset()) {
+            let title_width = inner_width.saturating_sub(item.depth * 2 + 4).max(1);
+            y += wrap_words(&item.title, title_width).len();
+            if clicked_row < y {
+                app.select_task(item.path);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The 0-based content row of `(x, y)` inside `area`, excluding its borders;
+/// `None` when the point falls outside or on the border itself.
+fn inner_row(area: Rect, x: u16, y: u16) -> Option<usize> {
+    let inside_x = x > area.x && x + 1 < area.x + area.width;
+    let inside_y = y > area.y && y + 1 < area.y + area.height;
+    (inside_x && inside_y).then(|| (y - area.y - 1) as usize)
+}
+
 /// Characters per row inside the editing dialog at this terminal width. The
 /// event loop reports it to the app so Up/Down move the cursor by exactly one
 /// rendered row.
@@ -769,18 +933,26 @@ mod tests {
         }
     }
 
-    /// Render the app into a test buffer and return it as one string per row.
-    fn render(app: &App, width: u16, height: u16) -> Vec<String> {
+    /// Render the app into a test buffer; returns one string per row plus the
+    /// pane geometry, so tests can aim mouse clicks at what was drawn.
+    fn render_with_ui(app: &App, width: u16, height: u16) -> (Vec<String>, PaneUi) {
+        let mut ui = PaneUi::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.draw(|frame| draw(frame, app, &mut ui)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        (0..height)
+        let rows = (0..height)
             .map(|y| {
                 (0..width)
                     .map(|x| buffer[(x, y)].symbol().to_string())
                     .collect::<String>()
             })
-            .collect()
+            .collect();
+        (rows, ui)
+    }
+
+    /// Render the app into a test buffer and return it as one string per row.
+    fn render(app: &App, width: u16, height: u16) -> Vec<String> {
+        render_with_ui(app, width, height).0
     }
 
     #[test]
@@ -819,6 +991,173 @@ mod tests {
             wrapped_rows >= 2,
             "dialog input should wrap across rows, got {rows:?}"
         );
+    }
+
+    #[test]
+    fn click_selects_workspace() {
+        let mut app = App::new(jot_cli::Store::default());
+        press(&mut app, KeyCode::Char('w')); // focus the workspaces pane
+        press(&mut app, KeyCode::Char('w')); // open the new-workspace dialog
+        type_str(&mut app, "Second");
+        press(&mut app, KeyCode::Enter);
+        app.select_workspace(0);
+        app.focus = Focus::Tasks;
+
+        // Row 1 is the pane's top border; the first workspace renders on
+        // row 1 of the content area (buffer row 2 is the second workspace
+        // only if the first doesn't wrap — the default name fits one line).
+        let (_, ui) = render_with_ui(&app, 60, 14);
+        assert!(handle_click(&mut app, &ui, 2, 2));
+        assert_eq!(app.store.selected_workspace, 1);
+        assert_eq!(app.focus, Focus::Workspaces);
+    }
+
+    #[test]
+    fn click_selects_task_across_wrapped_lines() {
+        let mut app = App::new(jot_cli::Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "aaaa bbbb cccc"); // wraps to two lines at 40 cols
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "second");
+        press(&mut app, KeyCode::Enter);
+
+        let (_, ui) = render_with_ui(&app, 40, 12);
+        let x = ui.task_area.x + 2;
+        let y = ui.task_area.y + 1;
+
+        // The wrapped first task covers content rows 0-1; its second line
+        // still selects it. The single-line second task sits on row 2.
+        assert!(handle_click(&mut app, &ui, x, y + 1));
+        assert_eq!(app.selected_path, Some(vec![0]));
+        assert_eq!(app.focus, Focus::Tasks);
+
+        assert!(handle_click(&mut app, &ui, x, y + 2));
+        assert_eq!(app.selected_path, Some(vec![1]));
+    }
+
+    #[test]
+    fn clicks_outside_panes_or_in_dialogs_do_nothing() {
+        let mut app = App::new(jot_cli::Store::default());
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "task");
+        press(&mut app, KeyCode::Enter);
+
+        let (_, ui) = render_with_ui(&app, 40, 12);
+        // On the border, and below the last item inside the pane.
+        assert!(!handle_click(&mut app, &ui, ui.task_area.x, ui.task_area.y));
+        assert!(!handle_click(&mut app, &ui, ui.task_area.x + 2, ui.task_area.y + 5));
+
+        // While a dialog is open, clicks are ignored entirely.
+        press(&mut app, KeyCode::Char('a'));
+        assert!(!handle_click(&mut app, &ui, ui.task_area.x + 2, ui.task_area.y + 1));
+    }
+
+    #[test]
+    fn two_sessions_reconcile_through_the_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join("jot-cli-tests")
+            .join(format!("two-sessions-{unique}.json"));
+
+        // Session A writes an initial item.
+        let mut app_a = App::new(jot_cli::Store::default());
+        let mut sync_a = FileSync::new(&path);
+        press(&mut app_a, KeyCode::Char('a'));
+        type_str(&mut app_a, "from A");
+        press(&mut app_a, KeyCode::Enter);
+        sync_a.save(&mut app_a, &path).expect("A saves");
+
+        // Session B starts from that file, then A adds another item.
+        let mut app_b = App::new(jot_cli::Store::load(&path).expect("B loads"));
+        let mut sync_b = FileSync::new(&path);
+        std::thread::sleep(Duration::from_millis(5)); // distinct mtime + stamps
+        press(&mut app_a, KeyCode::Char('a'));
+        type_str(&mut app_a, "later from A");
+        press(&mut app_a, KeyCode::Enter);
+        sync_a.save(&mut app_a, &path).expect("A saves again");
+
+        // B's periodic check folds A's addition in.
+        let merged = sync_b.check(&mut app_b, &path).expect("B checks");
+        assert!(merged, "B should notice A's write");
+        let titles: Vec<String> = app_b
+            .flattened_items()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["from A", "later from A"]);
+
+        // B deletes the first item; A picks the deletion up.
+        app_b.select_task(vec![0]);
+        press(&mut app_b, KeyCode::Char('d'));
+        press(&mut app_b, KeyCode::Char('y'));
+        sync_b.save(&mut app_b, &path).expect("B saves");
+        let merged = sync_a.check(&mut app_a, &path).expect("A checks");
+        assert!(merged, "A should notice B's deletion");
+        let titles: Vec<String> = app_a
+            .flattened_items()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["later from A"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mid_list_insertion_keeps_its_place_in_the_other_session() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join("jot-cli-tests")
+            .join(format!("mid-insert-{unique}.json"));
+
+        let mut app_a = App::new(jot_cli::Store::default());
+        let mut sync_a = FileSync::new(&path);
+        for title in ["one", "two", "three"] {
+            press(&mut app_a, KeyCode::Char('a'));
+            type_str(&mut app_a, title);
+            press(&mut app_a, KeyCode::Enter);
+        }
+        sync_a.save(&mut app_a, &path).expect("A saves");
+
+        let mut app_b = App::new(jot_cli::Store::load(&path).expect("B loads"));
+        let mut sync_b = FileSync::new(&path);
+
+        // A inserts a new item right after "one" (add inserts below the
+        // selection).
+        std::thread::sleep(Duration::from_millis(5));
+        app_a.select_task(vec![0]);
+        press(&mut app_a, KeyCode::Char('a'));
+        type_str(&mut app_a, "one-and-a-half");
+        press(&mut app_a, KeyCode::Enter);
+        sync_a.save(&mut app_a, &path).expect("A saves again");
+
+        assert!(sync_b.check(&mut app_b, &path).expect("B checks"));
+        let titles: Vec<String> = app_b
+            .flattened_items()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["one", "one-and-a-half", "two", "three"]);
+
+        // B's merged order is also what B writes back — reopening from B's
+        // file must show the same order.
+        sync_b.save(&mut app_b, &path).expect("B saves");
+        let reloaded = App::new(jot_cli::Store::load(&path).expect("reload"));
+        let titles: Vec<String> = reloaded
+            .flattened_items()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["one", "one-and-a-half", "two", "three"]);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
